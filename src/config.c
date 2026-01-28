@@ -62,6 +62,7 @@ void config_init(xvc_global_config_t *config)
         config->instances[i].frequency = DEFAULT_FREQUENCY;
         config->instances[i].latency_timer = DEFAULT_LATENCY;
         config->instances[i].async_mode = false;
+        config->instances[i].jtag_mode = JTAG_MODE_MPSSE;  /* Default to fast MPSSE mode */
         config->instances[i].whitelist_mode = WHITELIST_OFF;
         config->instances[i].enabled = false;
     }
@@ -206,6 +207,12 @@ int config_load(xvc_global_config_t *config, const char *path)
                             inst->latency_timer = atoi(value);
                         } else if (strcmp(setting, "async") == 0) {
                             inst->async_mode = (strcmp(value, "true") == 0 || strcmp(value, "1") == 0);
+                        } else if (strcmp(setting, "jtag_mode") == 0) {
+                            if (strcmp(value, "bitbang") == 0) {
+                                inst->jtag_mode = JTAG_MODE_BITBANG;
+                            } else {
+                                inst->jtag_mode = JTAG_MODE_MPSSE;  /* default */
+                            }
                         }
                     }
                 }

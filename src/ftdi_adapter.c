@@ -2,6 +2,10 @@
  * ftdi_adapter.c - FTDI Adapter Layer
  * XVC Server for Digilent HS2
  * Based on reference implementation in xvcd/src/io_ftdi.c
+ * 
+ * Supports two modes:
+ * - MPSSE mode (default): High-speed JTAG up to 30MHz
+ * - Bit-bang mode: Legacy fallback, max ~3MHz
  */
 
 #include <stdio.h>
@@ -9,6 +13,7 @@
 #include <string.h>
 #include <ftdi.h>
 #include "ftdi_adapter.h"
+#include "mpsse_adapter.h"
 #include "logging.h"
 
 /* I/O direction mask */
@@ -19,7 +24,14 @@
 
 /* Internal context structure */
 struct ftdi_context_s {
+    adapter_mode_t mode;                /* Current adapter mode */
+    
+    /* Bit-bang mode context (libftdi) */
     struct ftdi_context ftdi;
+    
+    /* MPSSE mode context */
+    mpsse_context_t *mpsse;
+    
     bool is_open;
     int verbose;
     char error[256];
@@ -32,6 +44,10 @@ ftdi_context_t* ftdi_adapter_create(void)
         return NULL;
     }
     
+    /* Default to MPSSE mode */
+    ctx->mode = ADAPTER_MODE_MPSSE;
+    
+    /* Initialize libftdi for bitbang fallback */
     int ret = ftdi_init(&ctx->ftdi);
     if (ret < 0) {
         free(ctx);
@@ -49,17 +65,27 @@ void ftdi_adapter_destroy(ftdi_context_t *ctx)
         ftdi_adapter_close(ctx);
     }
     
+    /* Cleanup based on mode */
+    if (ctx->mpsse) {
+        mpsse_adapter_destroy(ctx->mpsse);
+        ctx->mpsse = NULL;
+    }
+    
     ftdi_deinit(&ctx->ftdi);
     free(ctx);
 }
 
-int ftdi_adapter_open(ftdi_context_t *ctx, 
-                      int vendor, int product,
-                      const char *serial,
-                      int index, int interface)
+adapter_mode_t ftdi_adapter_get_mode(const ftdi_context_t *ctx)
 {
-    if (!ctx) return -1;
-    
+    return ctx ? ctx->mode : ADAPTER_MODE_MPSSE;
+}
+
+/* Internal: open device in bit-bang mode */
+static int ftdi_adapter_open_bitbang(ftdi_context_t *ctx,
+                                     int vendor, int product,
+                                     const char *serial,
+                                     int index, int interface)
+{
     if (product < 0) product = 0x6010;
     if (vendor < 0) vendor = 0x0403;
     
@@ -126,7 +152,6 @@ int ftdi_adapter_open(ftdi_context_t *ctx,
     }
     
     /* Initialize JTAG to TEST-LOGIC-RESET state */
-    /* Send 5 TMS=1 cycles to reset JTAG TAP controller */
     unsigned char reset_seq[10] = {
         FTDI_PORT_TMS,                   /* TMS=1, TCK=0 */
         FTDI_PORT_TMS | FTDI_PORT_TCK,  /* TMS=1, TCK=1 */
@@ -159,8 +184,6 @@ int ftdi_adapter_open(ftdi_context_t *ctx,
         return -1;
     }
     
-    /* Set default baudrate */
-    /* Flush buffers */
     if (ftdi_tcioflush(&ctx->ftdi) < 0) {
         LOG_WARN("Failed to flush FTDI buffers: %s", ftdi_get_error_string(&ctx->ftdi));
     }
@@ -175,9 +198,49 @@ int ftdi_adapter_open(ftdi_context_t *ctx,
         return -1;
     }
     
+    ctx->mode = ADAPTER_MODE_BITBANG;
     ctx->is_open = true;
-    LOG_INFO("FTDI device opened successfully");
+    LOG_INFO("FTDI device opened (BITBANG mode)");
     return 0;
+}
+
+int ftdi_adapter_open(ftdi_context_t *ctx, 
+                      int vendor, int product,
+                      const char *serial,
+                      int index, int interface)
+{
+    /* Default: try MPSSE mode first */
+    return ftdi_adapter_open_with_mode(ctx, vendor, product, serial, 
+                                       index, interface, ADAPTER_MODE_MPSSE);
+}
+
+int ftdi_adapter_open_with_mode(ftdi_context_t *ctx, 
+                                int vendor, int product,
+                                const char *serial,
+                                int index, int interface,
+                                adapter_mode_t mode)
+{
+    if (!ctx) return -1;
+    
+    if (mode == ADAPTER_MODE_MPSSE) {
+        /* Try MPSSE mode first */
+        ctx->mpsse = mpsse_adapter_create();
+        if (ctx->mpsse) {
+            if (mpsse_adapter_open(ctx->mpsse, vendor, product, serial, index, interface) == 0) {
+                ctx->mode = ADAPTER_MODE_MPSSE;
+                ctx->is_open = true;
+                LOG_INFO("FTDI device opened (MPSSE mode - high speed)");
+                return 0;
+            }
+            /* MPSSE failed, cleanup and fall back to bitbang */
+            LOG_WARN("MPSSE mode failed, falling back to bitbang mode");
+            mpsse_adapter_destroy(ctx->mpsse);
+            ctx->mpsse = NULL;
+        }
+    }
+    
+    /* Bitbang mode (either requested or MPSSE fallback) */
+    return ftdi_adapter_open_bitbang(ctx, vendor, product, serial, index, interface);
 }
 
 int ftdi_adapter_open_bus(ftdi_context_t *ctx, int bus, int device, int interface)
@@ -196,7 +259,12 @@ void ftdi_adapter_close(ftdi_context_t *ctx)
 {
     if (!ctx || !ctx->is_open) return;
     
-    ftdi_usb_close(&ctx->ftdi);
+    if (ctx->mode == ADAPTER_MODE_MPSSE && ctx->mpsse) {
+        mpsse_adapter_close(ctx->mpsse);
+    } else {
+        ftdi_usb_close(&ctx->ftdi);
+    }
+    
     ctx->is_open = false;
     LOG_INFO("FTDI device closed");
 }
@@ -210,25 +278,25 @@ int ftdi_adapter_set_period(ftdi_context_t *ctx, unsigned int period_ns)
 {
     if (!ctx || !ctx->is_open) return -1;
     
-    /* Convert period to baudrate for FT232H synchronous bitbang mode
-     * 
-     * In sync bitbang mode, the bit rate is approximately 4x the baudrate,
-     * because each byte clocks out 8 bits but the effective rate is higher
-     * due to USB buffering.
-     *
-     * FT232H limits:
-     *   - Max baudrate: 3,000,000 (3 Mbaud)
-     *   - This gives effective JTAG speed of ~6-12 MHz depending on USB
-     * 
-     * From period (ns) to baudrate:
-     *   target_freq_hz = 1,000,000,000 / period_ns
-     *   baudrate = target_freq_hz (we need one baud per bit)
-     *   But since we send 2 bytes per JTAG bit (low+high TCK), divide by 2
-     */
+    /* Convert period to frequency */
+    uint32_t frequency_hz = 1000000000 / period_ns;
+    
+    if (ctx->mode == ADAPTER_MODE_MPSSE && ctx->mpsse) {
+        /* MPSSE mode: use MPSSE adapter's frequency control */
+        int actual_freq = mpsse_adapter_set_frequency(ctx->mpsse, frequency_hz);
+        if (actual_freq < 0) return -1;
+        
+        int actual_period = 1000000000 / actual_freq;
+        LOG_INFO("TCK set (MPSSE): requested=%uns, actual=%uns, freq=%dHz", 
+                 period_ns, actual_period, actual_freq);
+        return actual_period;
+    }
+    
+    /* Bitbang mode: use baudrate control */
     int target_freq = 1000000000 / period_ns;
     int baudrate = target_freq * 2;  /* 2 bytes per bit cycle */
     
-    /* Clamp to valid range for FT232H
+    /* Clamp to valid range for FT232H bitbang
      * Min: 300 baud
      * Max: 3000000 baud (3 MHz - FT232H max in sync bitbang)
      */
@@ -246,7 +314,7 @@ int ftdi_adapter_set_period(ftdi_context_t *ctx, unsigned int period_ns)
     
     /* Return actual period */
     int actual_period = 2000000000 / baudrate;  /* 2 bytes per bit */
-    LOG_INFO("TCK set: requested=%uns, actual=%uns, baudrate=%d", 
+    LOG_INFO("TCK set (bitbang): requested=%uns, actual=%uns, baudrate=%d", 
              period_ns, actual_period, baudrate);
     return actual_period;
 }
@@ -269,7 +337,12 @@ int ftdi_adapter_scan(ftdi_context_t *ctx,
 {
     if (!ctx || !ctx->is_open || !tms || !tdi || !tdo) return -1;
     
-    /* Allocate buffer for double-clocked data */
+    /* MPSSE mode: use MPSSE adapter's scan */
+    if (ctx->mode == ADAPTER_MODE_MPSSE && ctx->mpsse) {
+        return mpsse_adapter_scan(ctx->mpsse, tms, tdi, tdo, bits);
+    }
+    
+    /* Bitbang mode: manual bit-by-bit clocking */
     unsigned char *buffer = malloc(bits * 2);
     if (!buffer) {
         LOG_ERROR("Failed to allocate scan buffer");
@@ -277,7 +350,6 @@ int ftdi_adapter_scan(ftdi_context_t *ctx,
     }
     
     /* Build output buffer: for each bit, output data then clock high */
-    /* Similar to xvcpi approach - explicit timing control */
     for (int i = 0; i < bits; i++) {
         unsigned char v = FTDI_DEFAULT_OUT;
         

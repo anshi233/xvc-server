@@ -1,1 +1,0 @@
-/usr/bin/cc -fPIC -O2 -g -DNDEBUG -shared -Wl,-soname,libftdi1.so.2 -o libftdi1.so.2.5.0 CMakeFiles/ftdi1.dir/ftdi.c.o CMakeFiles/ftdi1.dir/ftdi_stream.c.o  /home/anshi/xilinx_xvc_server/xvc-server/vendor/libusb/install/lib/libusb-1.0.a 

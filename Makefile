@@ -58,6 +58,7 @@ SERVER_SOURCES = $(SRC_DIR)/main.c \
                   $(SRC_DIR)/device_manager.c \
                   $(SRC_DIR)/xvc_protocol.c \
                   $(SRC_DIR)/ftdi_adapter.c \
+                  $(SRC_DIR)/mpsse_adapter.c \
                   $(SRC_DIR)/config.c \
                   $(SRC_DIR)/whitelist.c \
                   $(SRC_DIR)/logging.c

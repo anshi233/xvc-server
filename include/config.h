@@ -38,6 +38,12 @@ typedef enum {
     WHITELIST_STRICT        /* Block non-whitelisted */
 } whitelist_mode_t;
 
+/* JTAG adapter mode */
+typedef enum {
+    JTAG_MODE_MPSSE = 0,    /* MPSSE mode (default, fast, up to 30MHz) */
+    JTAG_MODE_BITBANG       /* Bit-bang mode (legacy, slow, max 3MHz) */
+} jtag_mode_t;
+
 /* Device identifier */
 typedef struct {
     device_id_type_t type;
@@ -62,6 +68,7 @@ typedef struct {
     uint32_t frequency;     /* TCK frequency in Hz */
     int latency_timer;      /* FTDI latency timer in ms */
     bool async_mode;        /* Use async FTDI operations */
+    jtag_mode_t jtag_mode;  /* JTAG adapter mode (MPSSE or bitbang) */
     
     /* Whitelist settings */
     whitelist_mode_t whitelist_mode;

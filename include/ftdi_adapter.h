@@ -23,6 +23,12 @@
 #define FTDI_DEFAULT_LATENCY    16      /* ms - increased for better stability */
 #define FTDI_DEFAULT_BAUDRATE   1000000 /* 1MHz for fast initial JTAG speed */
 
+/* Adapter mode */
+typedef enum {
+    ADAPTER_MODE_MPSSE = 0,     /* MPSSE mode (fast, default) */
+    ADAPTER_MODE_BITBANG        /* Bit-bang mode (legacy fallback) */
+} adapter_mode_t;
+
 /* FTDI context (opaque) */
 typedef struct ftdi_context_s ftdi_context_t;
 
@@ -53,6 +59,28 @@ int ftdi_adapter_open(ftdi_context_t *ctx,
                       int vendor, int product,
                       const char *serial,
                       int index, int interface);
+
+/**
+ * Open FTDI device with specific mode
+ * @param ctx FTDI context
+ * @param vendor Vendor ID (-1 for default 0x0403)
+ * @param product Product ID (-1 for default 0x6010)
+ * @param serial Serial number (NULL for any)
+ * @param index Device index (0 for first)
+ * @param interface Interface number (0-3)
+ * @param mode Adapter mode (MPSSE or bitbang)
+ * @return 0 on success, -1 on error
+ */
+int ftdi_adapter_open_with_mode(ftdi_context_t *ctx, 
+                                int vendor, int product,
+                                const char *serial,
+                                int index, int interface,
+                                adapter_mode_t mode);
+
+/**
+ * Get current adapter mode
+ */
+adapter_mode_t ftdi_adapter_get_mode(const ftdi_context_t *ctx);
 
 /**
  * Open FTDI device by bus location
