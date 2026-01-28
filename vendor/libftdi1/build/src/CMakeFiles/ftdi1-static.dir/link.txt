@@ -1,0 +1,2 @@
+/usr/bin/ar qc libftdi1.a CMakeFiles/ftdi1-static.dir/ftdi.c.o CMakeFiles/ftdi1-static.dir/ftdi_stream.c.o
+/usr/bin/ranlib libftdi1.a

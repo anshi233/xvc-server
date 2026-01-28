@@ -1,0 +1,11 @@
+prefix=/home/anshi/xilinx_xvc_server/xvc-server/vendor/libftdi1/install
+exec_prefix=/home/anshi/xilinx_xvc_server/xvc-server/vendor/libftdi1/install/bin
+libdir=/home/anshi/xilinx_xvc_server/xvc-server/vendor/libftdi1/install/lib
+includedir=/home/anshi/xilinx_xvc_server/xvc-server/vendor/libftdi1/install/include/libftdi1
+
+Name: libftdi1
+Description: Library to program and control the FTDI USB controller
+Requires: libusb-1.0
+Version: 1.5
+Libs: -L${libdir} -lftdi1
+Cflags: -I${includedir}
