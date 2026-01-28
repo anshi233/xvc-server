@@ -1,0 +1,38 @@
+[Unit]
+Description=Xilinx Virtual Cable Server for Digilent HS2
+Documentation=https://github.com/xilinx/xvc
+After=network.target local-fs.target
+
+[Service]
+Type=forking
+PIDFile=/var/run/xvc-server.pid
+ExecStart=/usr/local/bin/xvc-server -d /etc/xvc-server/xvc-server-multi.conf
+ExecStop=/bin/kill -TERM $MAINPID
+ExecReload=/bin/kill -HUP $MAINPID
+
+# Restart configuration
+Restart=always
+RestartSec=10
+TimeoutStartSec=30
+TimeoutStopSec=30
+
+# Resource limits
+LimitNOFILE=65536
+LimitCORE=infinity
+
+# Security
+NoNewPrivileges=no
+PrivateTmp=false
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=xvc-server
+
+# Kill configuration
+KillMode=mixed
+KillSignal=SIGTERM
+SendSIGKILL=yes
+
+[Install]
+WantedBy=multi-user.target

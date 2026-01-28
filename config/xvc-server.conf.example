@@ -1,0 +1,103 @@
+# XVC Server Configuration
+# Copy this file to /etc/xvc-server/xvc-server.conf and modify as needed
+
+[network]
+# TCP port to listen for Vivado connections
+listen_port = 2542
+
+# Maximum simultaneous client connections
+max_connections = 8
+
+# Connection timeout in seconds (0 = no timeout)
+connection_timeout = 300
+
+# TCP optimizations
+tcp_nodelay = true
+tcp_keepalive = true
+keepalive_idle = 30
+keepalive_cnt = 5
+
+[ip_whitelist]
+# Enable or disable IP whitelist (true/false)
+enabled = true
+
+# Whitelist mode: strict, permissive, off
+# strict: only allowlisted IPs can connect
+# permissive: allowlisted IPs allowed, others logged but not blocked
+# off: all IPs allowed (not recommended for production)
+mode = strict
+
+# Allow specific IP ranges (CIDR notation)
+allow_1 = 192.168.1.0/24
+allow_2 = 10.0.0.0/8
+
+# Block specific IP ranges (CIDR notation)
+block_1 = 0.0.0.0/8
+
+[logging]
+# Log level: debug, info, warn, error
+level = info
+
+# Log file location
+file = /var/log/xvc-server.log
+
+# Maximum log file size in bytes (default: 100MB)
+max_size = 104857600
+
+# Number of rotated log files to keep
+rotate_count = 10
+
+# Enable console output
+console = true
+
+[devices]
+# Device configuration file
+config_file = /etc/xvc-server/devices.conf
+
+# Device discovery interval in seconds
+discovery_interval = 60
+
+# Device timeout in seconds (no response = disconnected)
+device_timeout = 300
+
+# Default device identification method: serial, port, custom, auto
+id_method = auto
+
+# Maximum number of HS2 devices to support
+max_devices = 32
+
+[performance]
+# Default JTAG TCK frequency in Hz (0 = let client decide)
+default_frequency = 0
+
+# Vector buffer size in bytes (must match client capabilities)
+vector_buffer_size = 2048
+
+# FTDI latency timer in milliseconds (lower = faster, higher = more stable)
+ftdi_latency_timer = 4
+
+# Use async FTDI transfers (recommended for performance)
+ftdi_async = true
+
+[security]
+# Enable client authentication (future feature)
+auth_enabled = false
+
+# Allow only specific client versions (optional)
+client_version_whitelist = 1.0,2.0
+
+# Maximum connection attempts per minute
+max_connection_rate = 10
+
+[monitoring]
+# Enable health monitoring
+health_check_enabled = true
+
+# Health check interval in seconds
+health_check_interval = 60
+
+# Enable statistics collection
+stats_enabled = true
+
+# Statistics file location
+stats_file = /var/log/xvc-server-stats.log

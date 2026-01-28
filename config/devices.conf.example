@@ -1,0 +1,100 @@
+# XVC Server Device Mapping Configuration
+# Copy this file to /etc/xvc-server/devices.conf and modify as needed
+
+[global]
+# Device identification method: serial, port, custom, auto
+# serial: Use USB serial number (recommended, persistent)
+# port: Use USB bus:device address (consistent for same port)
+# custom: Use user-defined device ID (flexible)
+# auto: Automatic detection using VID:PID:serial
+id_method = auto
+
+# Device discovery interval in seconds
+discovery_interval = 60
+
+# Device timeout in seconds (no response = mark as disconnected)
+device_timeout = 300
+
+# Maximum number of HS2 devices to support
+max_devices = 32
+
+[device_mappings]
+# Format: device_id = client_ip
+# When a client connects from client_ip, they are assigned to the device_id
+# Use 'auto' to let server automatically assign available devices
+
+# Examples using USB serial number
+SN:ABC12345 = 192.168.1.100
+SN:DEF67890 = 192.168.1.101
+
+# Examples using USB port location
+BUS:001-002 = 192.168.1.102
+BUS:002-001 = 192.168.1.103
+
+# Examples using custom device ID
+CUSTOM:PROD01 = 192.168.1.104
+CUSTOM:PROD02 = 192.168.1.105
+
+# Auto-assignment (let server decide which device to use)
+auto = auto
+
+# IP-based assignment (assign specific IP to any available device)
+192.168.1.200 = auto
+192.168.1.201 = auto
+
+[device_aliases]
+# Human-readable aliases for devices (optional, for logging only)
+
+# Map device IDs to friendly names
+SN:ABC12345 = Production Board A
+SN:DEF67890 = Production Board B
+BUS:001-002 = Test Board
+CUSTOM:PROD01 = Development Board
+
+[device_settings]
+# Per-device settings (optional)
+
+# Format: device_id:setting=value
+
+# Example: Set specific TCK frequency for device
+SN:ABC12345:frequency = 10000000
+
+# Example: Set specific latency timer
+BUS:001-002:latency_timer = 2
+
+# Example: Enable/disable async transfers
+CUSTOM:PROD01:async = false
+
+[device_groups]
+# Group devices for management (optional)
+
+# Format: group_name = device_id1,device_id2,...
+
+# Example: Group production boards
+production = SN:ABC12345,SN:DEF67890
+
+# Example: Group test boards
+test = BUS:001-002,BUS:002-001
+
+[auto_assignment]
+# Rules for automatic device assignment (optional)
+
+# priority: IP range, device_type, serial_prefix
+# When using 'auto' assignment, these rules determine which device to assign
+
+# Example: Assign specific IP ranges to specific device types
+192.168.1.0/24:priority = SN:ABC12345
+
+# Example: Assign by device serial prefix
+SN:ABC*:priority = high
+SN:DEF*:priority = low
+
+[device_priorities]
+# Set priority for specific devices (1=highest, 32=lowest)
+# When multiple devices are available, higher priority is assigned first
+
+SN:ABC12345 = 1
+SN:DEF67890 = 2
+BUS:001-002 = 3
+BUS:002-001 = 4
+CUSTOM:PROD01 = 5
