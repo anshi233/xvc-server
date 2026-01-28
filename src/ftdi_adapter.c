@@ -366,12 +366,15 @@ int ftdi_adapter_set_frequency(ftdi_context_t *ctx, uint32_t frequency_hz)
 /*
  * JTAG scan using MPSSE
  * 
- * MPSSE provides two main ways to shift JTAG data:
- * 1. TMS shifting with data (for state machine navigation + small data)
- * 2. Data shifting (for bulk data in Shift-DR/Shift-IR states)
+ * For XVC protocol, we need to handle arbitrary TMS/TDI patterns.
+ * We use MPSSE command 0x6B (Clock Data to TMS with Read) which:
+ *   - Clocks TMS/TDI out on negative edge
+ *   - Samples TDO on positive edge
+ *   - TDI is in bit 7 of the data byte
+ *   - TMS is in bits 0-6
+ *   - TDO is returned in bit 7 of the response
  *
- * For XVC, we need to handle arbitrary TMS/TDI patterns, so we use
- * the TMS shift command which allows simultaneous TDI and TDO.
+ * To ensure each bit gets its own TDI value, we shift 1 bit at a time.
  */
 int ftdi_adapter_scan(ftdi_context_t *ctx,
                       const uint8_t *tms,
@@ -386,87 +389,58 @@ int ftdi_adapter_scan(ftdi_context_t *ctx,
     memset(tdo, 0, (bits + 7) / 8);
     
     /* 
-     * Use MPSSE_CMD_TMS_IO_NEG (0x6B) for each bit:
-     *   - Clocks TMS data out on negative edge
-     *   - Reads TDO on positive edge
-     *   - Also drives TDI (bit 7 of data byte)
-     *
-     * Format: 0x6B, length-1, data
-     * Data byte: bit 0-6 = TMS data, bit 7 = TDI state
-     * 
-     * We can shift up to 7 bits at a time with one command
+     * Build command buffer: shift 1 bit at a time
+     * Each bit requires: 0x6B, 0x00, data_byte
+     * Where data_byte = (TDI << 7) | (TMS & 0x01)
      */
     
     uint8_t *cmd = ctx->cmd_buffer;
     size_t cmd_len = 0;
-    size_t expected_read = 0;
     
-    int bit_idx = 0;
-    
-    while (bit_idx < bits) {
-        /* Determine how many bits to send (max 7 per TMS command) */
-        int chunk_bits = bits - bit_idx;
-        if (chunk_bits > 7) chunk_bits = 7;
+    for (int i = 0; i < bits; i++) {
+        /* Get TMS and TDI for this bit */
+        int tms_val = (tms[i / 8] >> (i % 8)) & 1;
+        int tdi_val = (tdi[i / 8] >> (i % 8)) & 1;
         
-        /* Build TMS data byte with TDI in bit 7 */
-        uint8_t tms_data = 0;
-        for (int i = 0; i < chunk_bits; i++) {
-            int src_bit = bit_idx + i;
-            if (tms[src_bit / 8] & (1 << (src_bit % 8))) {
-                tms_data |= (1 << i);
-            }
+        /* Build data byte: TDI in bit 7, TMS in bit 0 */
+        uint8_t data_byte = (tdi_val << 7) | tms_val;
+        
+        /* Check buffer space (need 3 bytes per bit + 1 for SEND_IMMEDIATE) */
+        if (cmd_len + 4 > ctx->cmd_buffer_size) {
+            /* Buffer full - this shouldn't happen with 64K buffer */
+            LOG_ERROR("MPSSE command buffer overflow at bit %d", i);
+            return -1;
         }
         
-        /* Get TDI for first bit of this chunk (TDI is held constant) */
-        int tdi_bit = bit_idx;
-        if (tdi[tdi_bit / 8] & (1 << (tdi_bit % 8))) {
-            tms_data |= 0x80;  /* TDI in bit 7 */
-        }
-        
-        /* Check buffer space */
-        if (cmd_len + 3 > ctx->cmd_buffer_size) {
-            /* Flush and process */
-            int ret = mpsse_flush_and_read(ctx, tdo, expected_read);
-            if (ret < 0) return ret;
-            cmd_len = 0;
-            expected_read = 0;
-        }
-        
-        /* Add TMS shift command */
-        cmd[cmd_len++] = MPSSE_CMD_TMS_IO_NEG;
-        cmd[cmd_len++] = chunk_bits - 1;  /* Length is 0-indexed */
-        cmd[cmd_len++] = tms_data;
-        
-        expected_read++;  /* Each TMS command returns 1 byte */
-        bit_idx += chunk_bits;
+        cmd[cmd_len++] = MPSSE_CMD_TMS_IO_NEG;  /* 0x6B */
+        cmd[cmd_len++] = 0;                      /* Length = 1 bit (0-indexed) */
+        cmd[cmd_len++] = data_byte;
     }
     
-    /* Send SEND_IMMEDIATE to flush */
-    if (cmd_len + 1 <= ctx->cmd_buffer_size) {
-        cmd[cmd_len++] = SEND_IMMEDIATE;
-    }
+    /* Add SEND_IMMEDIATE to flush */
+    cmd[cmd_len++] = SEND_IMMEDIATE;
     
-    /* Write commands */
+    /* Write all commands */
     int ret = ftdi_write_data(&ctx->ftdi, cmd, cmd_len);
     if (ret != (int)cmd_len) {
         snprintf(ctx->error, sizeof(ctx->error),
-                 "ftdi_write_data: %d (%s)",
-                 ret, ftdi_get_error_string(&ctx->ftdi));
+                 "ftdi_write_data: expected %zu, got %d (%s)",
+                 cmd_len, ret, ftdi_get_error_string(&ctx->ftdi));
         LOG_ERROR("%s", ctx->error);
         return -1;
     }
     
-    /* Read TDO data */
-    uint8_t *read_buf = malloc(expected_read);
+    /* Read TDO data - 1 byte per bit */
+    uint8_t *read_buf = malloc(bits);
     if (!read_buf) {
-        LOG_ERROR("Failed to allocate read buffer");
+        LOG_ERROR("Failed to allocate read buffer for %d bytes", bits);
         return -1;
     }
     
     size_t total_read = 0;
     int timeout = 1000;
-    while (total_read < expected_read && timeout-- > 0) {
-        ret = ftdi_read_data(&ctx->ftdi, read_buf + total_read, expected_read - total_read);
+    while (total_read < (size_t)bits && timeout-- > 0) {
+        ret = ftdi_read_data(&ctx->ftdi, read_buf + total_read, bits - total_read);
         if (ret < 0) {
             snprintf(ctx->error, sizeof(ctx->error),
                      "ftdi_read_data: %d (%s)",
@@ -478,36 +452,19 @@ int ftdi_adapter_scan(ftdi_context_t *ctx,
         total_read += ret;
     }
     
-    if (total_read < expected_read) {
-        LOG_ERROR("Timeout reading TDO data (got %zu, expected %zu)", total_read, expected_read);
+    if (total_read < (size_t)bits) {
+        LOG_ERROR("Timeout reading TDO (got %zu, expected %d)", total_read, bits);
         free(read_buf);
         return -1;
     }
     
     /* Extract TDO bits from read data
-     * Each TMS command returns 1 byte with TDO in bit 7
-     * For multi-bit TMS commands, the bits are LSB first in positions 0-6
+     * For 0x6B command with 1 bit, TDO is in bit 7 of the response byte
      */
-    bit_idx = 0;
-    size_t read_idx = 0;
-    
-    while (bit_idx < bits && read_idx < total_read) {
-        int chunk_bits = bits - bit_idx;
-        if (chunk_bits > 7) chunk_bits = 7;
-        
-        uint8_t tdo_byte = read_buf[read_idx++];
-        
-        /* TDO bits are in positions 0-6 (shifted right from bit 7) */
-        for (int i = 0; i < chunk_bits; i++) {
-            int dst_bit = bit_idx + i;
-            /* TDO for bit i is in bit (7 - chunk_bits + 1 + i) of the read byte */
-            /* Actually for TMS command, TDO is shifted LSB first into bit 7 */
-            if (tdo_byte & (1 << (7 - chunk_bits + 1 + i))) {
-                tdo[dst_bit / 8] |= (1 << (dst_bit % 8));
-            }
+    for (int i = 0; i < bits; i++) {
+        if (read_buf[i] & 0x80) {  /* TDO is in bit 7 */
+            tdo[i / 8] |= (1 << (i % 8));
         }
-        
-        bit_idx += chunk_bits;
     }
     
     free(read_buf);
