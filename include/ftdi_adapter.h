@@ -1,7 +1,6 @@
 /*
- * ftdi_adapter.h - FTDI Adapter Layer (MPSSE Mode)
- * XVC Server for Digilent HS2 / FT232H
- * Supports up to 30 MHz TCK frequency
+ * ftdi_adapter.h - FTDI Adapter Layer
+ * XVC Server for Digilent HS2
  */
 
 #ifndef XVC_FTDI_ADAPTER_H
@@ -10,16 +9,19 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-/* JTAG port bit definitions (for MPSSE low byte) */
+/* JTAG port bit definitions */
 #define FTDI_PORT_TCK   0x01
 #define FTDI_PORT_TDI   0x02
 #define FTDI_PORT_TDO   0x04
 #define FTDI_PORT_TMS   0x08
+#define FTDI_PORT_MISC  0x90
+
+/* Default output state */
+#define FTDI_DEFAULT_OUT    0xE0
 
 /* Default settings */
-#define FTDI_DEFAULT_LATENCY    1       /* ms - minimum for maximum throughput */
-#define FTDI_DEFAULT_FREQ_HZ    6000000 /* 6 MHz default TCK frequency */
-#define FTDI_MAX_FREQ_HZ        30000000 /* 30 MHz max for FT232H MPSSE */
+#define FTDI_DEFAULT_LATENCY    16      /* ms - increased for better stability */
+#define FTDI_DEFAULT_BAUDRATE   1000000 /* 1MHz for fast initial JTAG speed */
 
 /* FTDI context (opaque) */
 typedef struct ftdi_context_s ftdi_context_t;
