@@ -39,6 +39,7 @@
 #define MPSSE_CMD_ENABLE_ADAPTIVE           0x96
 #define MPSSE_CMD_LOOPBACK_OFF              0x85
 #define MPSSE_CMD_LOOPBACK_ON               0x84
+#define MPSSE_CMD_DISABLE_3_PHASE_CLOCK      0x8d
 
 /* FTDI pin assignments for JTAG (low byte of GPIO) */
 #define MPSSE_PIN_TCK       0x01

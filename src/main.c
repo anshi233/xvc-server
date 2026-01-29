@@ -140,10 +140,16 @@ static int run_instance(xvc_instance_config_t *inst_config)
     }
     
     int ret;
+    adapter_mode_t mode = (inst_config->jtag_mode == JTAG_MODE_BITBANG) 
+                          ? ADAPTER_MODE_BITBANG 
+                          : ADAPTER_MODE_MPSSE;
+    
     if (inst_config->device_id.type == DEVICE_ID_SERIAL || device->serial[0]) {
-        ret = ftdi_adapter_open(ctx.ftdi, device->vendor_id, device->product_id, device->serial, 0, 0);
+        ret = ftdi_adapter_open_with_mode(ctx.ftdi, device->vendor_id, device->product_id, 
+                                           device->serial, 0, 0, mode);
     } else {
-        ret = ftdi_adapter_open(ctx.ftdi, device->vendor_id, device->product_id, NULL, 0, 0);
+        ret = ftdi_adapter_open_with_mode(ctx.ftdi, device->vendor_id, device->product_id, 
+                                           NULL, 0, 0, mode);
     }
     
     if (ret < 0) {
