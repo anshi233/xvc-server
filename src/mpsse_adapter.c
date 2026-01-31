@@ -414,9 +414,9 @@ static int mpsse_buffer_append(mpsse_context_t *ctx, const uint8_t *tx_data, int
 {
     struct mpsse_buffer *b = &ctx->buffer;
     
-    /* Safety flush: check if adding this data would exceed buffer limits or hit 512 byte threshold
-     * Use >= to flush BEFORE exceeding threshold, preventing buffer overflow */
-    int flush_threshold = 512;
+    /* Safety flush: check if adding this data would exceed buffer limits or hit 960 byte threshold
+     * Use >= to flush BEFORE exceeding threshold, preventing FT232H 1024 byte overflow */
+    int flush_threshold = 960;  /* 960 bytes with 64 byte margin for FT232H 1024 byte limit */
     
     /* Check remaining space to avoid overflow */
     bool would_overflow = (b->tx_num_bytes + tx_bytes > b->max_tx_buffer_bytes ||
