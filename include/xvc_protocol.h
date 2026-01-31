@@ -12,8 +12,8 @@
 /* XVC protocol version */
 #define XVC_VERSION "xvcServer_v1.0"
 
-/* Maximum vector size in bytes (TMS + TDI combined) */
-#define XVC_MAX_VECTOR_SIZE 2048
+/* Default maximum vector size in bytes (TMS + TDI combined) */
+#define XVC_DEFAULT_MAX_VECTOR_SIZE 2048
 
 /* JTAG states */
 typedef enum {
@@ -53,15 +53,17 @@ typedef struct {
     jtag_state_t jtag_state;
     bool seen_tlr;          /* Seen test-logic-reset */
     uint32_t frequency;     /* Current TCK frequency */
-    
+    int max_vector_size;    /* Maximum vector size in bytes */
+    int usb_chunk_size;     /* USB transfer chunk size (0 = auto) */
+
     /* FTDI adapter reference */
     struct ftdi_context_s *ftdi;
-    
-    /* Buffers */
+
+    /* Buffers - dynamically allocated based on max_vector_size */
     uint8_t cmd_buf[16];
-    uint8_t vector_buf[XVC_MAX_VECTOR_SIZE];
-    uint8_t result_buf[XVC_MAX_VECTOR_SIZE];
-    
+    uint8_t *vector_buf;    /* Allocated: max_vector_size bytes */
+    uint8_t *result_buf;    /* Allocated: max_vector_size bytes */
+
     /* Statistics */
     uint64_t bytes_rx;
     uint64_t bytes_tx;
@@ -75,9 +77,18 @@ typedef struct {
  * @param ctx XVC context
  * @param socket_fd Client socket
  * @param ftdi FTDI adapter context
+ * @param max_vector_size Maximum vector size in bytes (0 for default)
+ * @param usb_chunk_size USB transfer chunk size (0 for auto)
  * @return 0 on success, -1 on error
  */
-int xvc_init(xvc_context_t *ctx, int socket_fd, struct ftdi_context_s *ftdi);
+int xvc_init(xvc_context_t *ctx, int socket_fd, struct ftdi_context_s *ftdi, 
+             int max_vector_size, int usb_chunk_size);
+
+/**
+ * Free XVC protocol context resources
+ * @param ctx XVC context
+ */
+void xvc_free(xvc_context_t *ctx);
 
 /**
  * Handle incoming data from client

@@ -21,6 +21,9 @@
 #define DEFAULT_BASE_PORT   2542
 #define DEFAULT_FREQUENCY   10000000  /* 10 MHz */
 #define DEFAULT_LATENCY     1         /* ms */
+#define DEFAULT_XVC_BUFFER_SIZE 2048      /* Default XVC buffer size in bytes */
+#define MIN_XVC_BUFFER_SIZE     64        /* Minimum XVC buffer size */
+#define MAX_XVC_BUFFER_SIZE     536870912 /* Maximum XVC buffer size: 512MB */
 
 /* Device ID types */
 typedef enum {
@@ -74,7 +77,11 @@ typedef struct {
     whitelist_mode_t whitelist_mode;
     whitelist_entry_t whitelist[MAX_WHITELIST_ENTRIES];
     int whitelist_count;
-    
+
+    /* XVC buffer settings */
+    int xvc_buffer_size;    /* XVC max vector size in bytes */
+    int usb_chunk_size;     /* USB transfer chunk size for splitting large messages */
+
     /* Runtime state */
     bool enabled;
     pid_t pid;              /* Child process PID */

@@ -11,6 +11,7 @@
 #include "xvc_protocol.h"
 #include "ftdi_adapter.h"
 #include "logging.h"
+#include "config.h"
 
 /* Helper to dump buffer in trace mode */
 static void log_buffer(const char *prefix, const uint8_t *buf, int len)
@@ -113,33 +114,68 @@ const char* jtag_state_name(jtag_state_t state)
     return "UNKNOWN";
 }
 
-int xvc_init(xvc_context_t *ctx, int socket_fd, struct ftdi_context_s *ftdi)
+int xvc_init(xvc_context_t *ctx, int socket_fd, struct ftdi_context_s *ftdi,
+             int max_vector_size, int usb_chunk_size)
 {
     if (!ctx) return -1;
-    
+
     memset(ctx, 0, sizeof(xvc_context_t));
     ctx->socket_fd = socket_fd;
     ctx->ftdi = ftdi;
     ctx->jtag_state = JTAG_TEST_LOGIC_RESET;
     ctx->seen_tlr = false;
-    
+
+    /* Set vector size with bounds checking */
+    if (max_vector_size <= 0) {
+        ctx->max_vector_size = XVC_DEFAULT_MAX_VECTOR_SIZE;
+    } else {
+        ctx->max_vector_size = max_vector_size;
+    }
+    ctx->usb_chunk_size = usb_chunk_size;
+
+    /* Allocate buffers dynamically */
+    ctx->vector_buf = malloc(ctx->max_vector_size);
+    ctx->result_buf = malloc(ctx->max_vector_size);
+
+    if (!ctx->vector_buf || !ctx->result_buf) {
+        free(ctx->vector_buf);
+        free(ctx->result_buf);
+        ctx->vector_buf = NULL;
+        ctx->result_buf = NULL;
+        LOG_ERROR("Failed to allocate XVC buffers (size=%d)", ctx->max_vector_size);
+        return -1;
+    }
+
+    LOG_DBG("XVC initialized: max_vector_size=%d, usb_chunk_size=%d",
+            ctx->max_vector_size, ctx->usb_chunk_size);
+
     return 0;
+}
+
+void xvc_free(xvc_context_t *ctx)
+{
+    if (!ctx) return;
+
+    free(ctx->vector_buf);
+    free(ctx->result_buf);
+    ctx->vector_buf = NULL;
+    ctx->result_buf = NULL;
 }
 
 void xvc_close(xvc_context_t *ctx)
 {
     if (!ctx) return;
-    
+
     LOG_DBG("XVC session closed: rx=%lu tx=%lu cmds=%lu",
               ctx->bytes_rx, ctx->bytes_tx, ctx->commands);
 }
 
 int xvc_handle(xvc_context_t *ctx, uint32_t frequency)
 {
-    if (!ctx) return -1;
-    
+    if (!ctx || !ctx->vector_buf || !ctx->result_buf) return -1;
+
     char xvc_info[64];
-    snprintf(xvc_info, sizeof(xvc_info), "%s:%d\n", XVC_VERSION, XVC_MAX_VECTOR_SIZE);
+    snprintf(xvc_info, sizeof(xvc_info), "%s:%d\n", XVC_VERSION, ctx->max_vector_size);
     
     do {
         /* Read command (first 2 bytes) */
@@ -213,9 +249,9 @@ int xvc_handle(xvc_context_t *ctx, uint32_t frequency)
             
             int32_t len = xvc_get_int32(ctx->cmd_buf + 6);
             int nr_bytes = (len + 7) / 8;
-            
-            if (nr_bytes > XVC_MAX_VECTOR_SIZE) {
-                LOG_ERROR("Vector size exceeded: %d", nr_bytes);
+
+            if (nr_bytes > ctx->max_vector_size) {
+                LOG_ERROR("Vector size exceeded: %d > %d", nr_bytes, ctx->max_vector_size);
                 return -1;
             }
             
@@ -253,15 +289,28 @@ int xvc_handle(xvc_context_t *ctx, uint32_t frequency)
                 log_buffer("TMS", ctx->vector_buf, nr_bytes);
                 log_buffer("TDI", ctx->vector_buf + nr_bytes, nr_bytes);
 
-                if (ftdi_adapter_scan(ctx->ftdi, 
-                                      ctx->vector_buf, 
-                                      ctx->vector_buf + nr_bytes,
-                                      ctx->result_buf, 
-                                      len) < 0) {
+                /* Use chunked scan if usb_chunk_size is configured */
+                int scan_result;
+                if (ctx->usb_chunk_size > 0) {
+                    scan_result = ftdi_adapter_scan_chunked(ctx->ftdi,
+                                                            ctx->vector_buf,
+                                                            ctx->vector_buf + nr_bytes,
+                                                            ctx->result_buf,
+                                                            len,
+                                                            ctx->usb_chunk_size);
+                } else {
+                    scan_result = ftdi_adapter_scan(ctx->ftdi,
+                                                    ctx->vector_buf,
+                                                    ctx->vector_buf + nr_bytes,
+                                                    ctx->result_buf,
+                                                    len);
+                }
+
+                if (scan_result < 0) {
                     LOG_ERROR("FTDI scan failed");
                     return -1;
                 }
-                
+
                 log_buffer("TDO", ctx->result_buf, nr_bytes);
             }
             

@@ -63,7 +63,8 @@ instance_id_end = 32
 #   latency_timer     - FTDI latency timer in ms (default: 2, range: 1-255)
 #   async             - Enable async I/O (default: true)
 #   interface         - FTDI interface (default: 0)
-#   vector_buffer_size - Vector buffer size in bytes (default: 2048)
+#   xvc_buffer_size   - XVC max vector size in bytes (default: 2048, min: 64, max: 65536)
+#   usb_chunk_size    - USB transfer chunk size in bytes (default: 0=auto, use 256-512 for small USB buffers)
 
 # Example: Set specific TCK frequency for instance 1
 1:frequency = 10000000
@@ -76,6 +77,12 @@ instance_id_end = 32
 
 # Example: Set interface index for instance 1
 1:interface = 0
+
+# Example: Increase XVC buffer size for faster programming (requires client support)
+1:xvc_buffer_size = 4096
+
+# Example: Use smaller USB chunks for devices with small USB buffers
+2:usb_chunk_size = 256
 
 [instance_aliases]
 # Human-readable aliases for instances

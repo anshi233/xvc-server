@@ -136,6 +136,23 @@ int ftdi_adapter_scan(ftdi_context_t *ctx,
                       int bits);
 
 /**
+ * Perform JTAG scan operation with chunking for large transfers
+ * @param ctx FTDI context
+ * @param tms TMS data bytes
+ * @param tdi TDI data bytes
+ * @param tdo Output TDO data bytes
+ * @param bits Number of bits to scan
+ * @param chunk_bytes Maximum chunk size in bytes (0 for adapter default)
+ * @return 0 on success, -1 on error
+ */
+int ftdi_adapter_scan_chunked(ftdi_context_t *ctx,
+                               const uint8_t *tms,
+                               const uint8_t *tdi,
+                               uint8_t *tdo,
+                               int bits,
+                               int chunk_bytes);
+
+/**
  * Get last error message
  */
 const char* ftdi_adapter_error(const ftdi_context_t *ctx);
