@@ -20,7 +20,7 @@
 /* Default values */
 #define DEFAULT_BASE_PORT   2542
 #define DEFAULT_FREQUENCY   10000000  /* 10 MHz */
-#define DEFAULT_LATENCY     2         /* ms */
+#define DEFAULT_LATENCY     1         /* ms */
 
 /* Device ID types */
 typedef enum {
