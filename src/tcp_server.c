@@ -204,6 +204,13 @@ int tcp_server_poll(tcp_server_t *server, int timeout_ms)
                 setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, 
                            &flag, sizeof(flag));
                 
+                /* Increase socket buffer sizes for better throughput */
+                int buf_size = 256 * 1024;  /* 256KB send/receive buffers */
+                setsockopt(client_fd, SOL_SOCKET, SO_SNDBUF, 
+                           &buf_size, sizeof(buf_size));
+                setsockopt(client_fd, SOL_SOCKET, SO_RCVBUF, 
+                           &buf_size, sizeof(buf_size));
+                
                 server->connection_count++;
                 update_max_fd(server);
                 
