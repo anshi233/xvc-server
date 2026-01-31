@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/time.h>
 #include <ftdi.h>
 #include "mpsse_adapter.h"
 #include "logging.h"
@@ -52,6 +53,13 @@ enum jtag_state {
 
 typedef void (*rx_observer_fn)(const uint8_t *rxData, void *extra);
 
+#define MEMORY_POOL_SIZE 4096
+
+struct memory_pool {
+    uint8_t buffer[MEMORY_POOL_SIZE * 256];
+    size_t used;
+};
+
 struct rx_observer_node {
     struct rx_observer_node *next;
     rx_observer_fn fn;
@@ -78,12 +86,37 @@ struct mpsse_context_s {
     bool is_open;
     int verbose;
     int chip_buffer_size;  /* Chip FIFO buffer size: 1024 for FT232H, 4096 for FT2232H */
+    struct memory_pool observer_pool;
+    struct timeval last_flush_time;
+    int total_flushes;
+    int failed_flushes;
     char error[256];
 };
 
 static inline int min(int a, int b)
 {
     return a < b ? a : b;
+}
+
+static inline void* pool_alloc(struct memory_pool *pool, size_t size)
+{
+    if (pool->used + size > sizeof(pool->buffer)) {
+        return NULL;
+    }
+    void *ptr = pool->buffer + pool->used;
+    pool->used += size;
+    return ptr;
+}
+
+static inline void pool_reset(struct memory_pool *pool)
+{
+    pool->used = 0;
+}
+
+static inline long time_diff_ms(struct timeval *start, struct timeval *end)
+{
+    return (end->tv_sec - start->tv_sec) * 1000 + 
+           (end->tv_usec - start->tv_usec) / 1000;
 }
 
 static inline int get_bit(const uint8_t *p, int idx)
@@ -132,6 +165,10 @@ mpsse_context_t* mpsse_adapter_create(void)
     ctx->state = TEST_LOGIC_RESET;
     ctx->last_tdi = 0;
     ctx->chip_buffer_size = 1024;  /* Default to minimum (FT232H) */
+    pool_reset(&ctx->observer_pool);
+    gettimeofday(&ctx->last_flush_time, NULL);
+    ctx->total_flushes = 0;
+    ctx->failed_flushes = 0;
 
     return ctx;
 }
@@ -221,18 +258,47 @@ static int mpsse_buffer_flush(mpsse_context_t *ctx)
     struct mpsse_buffer *b = &ctx->buffer;
     
     if (b->tx_num_bytes > 0) {
+        struct timeval now;
+        gettimeofday(&now, NULL);
+        
+        long time_since_last = 0;
+        if (ctx->total_flushes > 0) {
+            time_since_last = time_diff_ms(&ctx->last_flush_time, &now);
+        }
+        
+        LOG_TRACE("Flushing TX buffer: %d bytes (time since last: %ldms)", 
+                  b->tx_num_bytes, time_since_last);
+        
         int ret = ftdi_write_data(&ctx->ftdi, b->tx_buffer, b->tx_num_bytes);
+        ctx->total_flushes++;
+        
         if (ret < 0) {
-            LOG_ERROR("Failed to write to FTDI: %s", ftdi_get_error_string(&ctx->ftdi));
+            ctx->failed_flushes++;
+            LOG_ERROR("USB write failed: ret=%d, requested=%d bytes, error='%s'", 
+                      ret, b->tx_num_bytes, ftdi_get_error_string(&ctx->ftdi));
+            LOG_ERROR("USB error details: flush_count=%d/%d failed", 
+                      ctx->failed_flushes, ctx->total_flushes);
+            LOG_ERROR("Timing: time_since_last_flush=%ldms", time_since_last);
+            LOG_DBG("TX buffer state: tx=%d/%d, rx=%d/%d", 
+                    b->tx_num_bytes, b->max_tx_buffer_bytes, 
+                    b->rx_num_bytes, b->max_rx_buffer_bytes);
             mpsse_chip_recovery(ctx);
             return -1;
         }
         if (ret != b->tx_num_bytes) {
-            LOG_ERROR("Only wrote %d of %d bytes", ret, b->tx_num_bytes);
+            ctx->failed_flushes++;
+            LOG_ERROR("Partial write: only %d of %d bytes", ret, b->tx_num_bytes);
+            LOG_ERROR("Flush statistics: %d/%d failed, time_since_last=%ldms",
+                      ctx->failed_flushes, ctx->total_flushes, time_since_last);
+            LOG_DBG("TX buffer state: tx=%d/%d, rx=%d/%d", 
+                    b->tx_num_bytes, b->max_tx_buffer_bytes, 
+                    b->rx_num_bytes, b->max_rx_buffer_bytes);
             mpsse_chip_recovery(ctx);
             return -1;
         }
+        LOG_TRACE("TX flush successful: %d bytes", ret);
         b->tx_num_bytes = 0;
+        ctx->last_flush_time = now;
     }
     
     if (b->rx_num_bytes > 0) {
@@ -269,6 +335,8 @@ static int mpsse_buffer_flush(mpsse_context_t *ctx)
         
         b->rx_observer_first = b->rx_observer_last = NULL;
         b->rx_num_bytes = 0;
+        /* NOTE: Don't reset pool here - observer extras are allocated before append,
+         * and pool_reset would invalidate them. Pool will be reused circularly. */
     }
     
     return 0;
@@ -315,8 +383,18 @@ static int mpsse_buffer_ensure_can_append(mpsse_context_t *ctx, int tx_bytes, in
 {
     struct mpsse_buffer *b = &ctx->buffer;
     
+    /* Safety flush at 80% capacity to prevent overflow when batching operations */
+    int tx_safety_threshold = (b->max_tx_buffer_bytes * 8) / 10;  /* 80% */
+    int rx_safety_threshold = (b->max_rx_buffer_bytes * 8) / 10;
+    
     if (b->tx_num_bytes + tx_bytes > b->max_tx_buffer_bytes ||
-        b->rx_num_bytes + rx_bytes > b->max_rx_buffer_bytes) {
+        b->rx_num_bytes + rx_bytes > b->max_rx_buffer_bytes ||
+        b->tx_num_bytes > tx_safety_threshold ||
+        b->rx_num_bytes > rx_safety_threshold) {
+        LOG_TRACE("Safety flush triggered: tx=%d/%d, rx=%d/%d, adding tx=%d, rx=%d",
+                  b->tx_num_bytes, b->max_tx_buffer_bytes,
+                  b->rx_num_bytes, b->max_rx_buffer_bytes,
+                  tx_bytes, rx_bytes);
         if (mpsse_buffer_flush(ctx) < 0) {
             return -1;
         }
@@ -336,16 +414,51 @@ static int mpsse_buffer_append(mpsse_context_t *ctx, const uint8_t *tx_data, int
 {
     struct mpsse_buffer *b = &ctx->buffer;
     
+    /* Safety flush: check if adding this data would exceed buffer limits or hit 512 byte threshold
+     * Use >= to flush BEFORE exceeding threshold, preventing buffer overflow */
+    int flush_threshold = 512;
+    
+    /* Check remaining space to avoid overflow */
+    bool would_overflow = (b->tx_num_bytes + tx_bytes > b->max_tx_buffer_bytes ||
+                           b->rx_num_bytes + rx_bytes > b->max_rx_buffer_bytes);
+    
+    /* Flush if we're at or past threshold (flush BEFORE adding more) */
+    bool at_threshold = (b->tx_num_bytes >= flush_threshold ||
+                         b->rx_num_bytes >= flush_threshold);
+    
+    if (would_overflow || at_threshold) {
+        if (b->rx_num_bytes > 0) {
+            LOG_TRACE("Pre-append flush with RX: tx=%d+%d, rx=%d+%d",
+                      b->tx_num_bytes, tx_bytes, b->rx_num_bytes, rx_bytes);
+        } else {
+            LOG_TRACE("Pre-append flush TX only: tx=%d+%d",
+                      b->tx_num_bytes, tx_bytes);
+        }
+        if (mpsse_buffer_flush(ctx) < 0) {
+            return -1;
+        }
+    }
+    
     if (tx_bytes > 0) {
+        if (b->tx_num_bytes + tx_bytes > b->max_tx_buffer_bytes) {
+            LOG_ERROR("TX buffer overflow after flush: %d+%d > %d",
+                      b->tx_num_bytes, tx_bytes, b->max_tx_buffer_bytes);
+            return -1;
+        }
         memcpy(b->tx_buffer + b->tx_num_bytes, tx_data, tx_bytes);
         b->tx_num_bytes += tx_bytes;
     }
     
     if (rx_bytes > 0) {
+        if (b->rx_num_bytes + rx_bytes > b->max_rx_buffer_bytes) {
+            LOG_ERROR("RX buffer overflow after flush: %d+%d > %d",
+                      b->rx_num_bytes, rx_bytes, b->max_rx_buffer_bytes);
+            return -1;
+        }
         if (observer) {
-            struct rx_observer_node *node = malloc(sizeof(struct rx_observer_node));
+            struct rx_observer_node *node = pool_alloc(&ctx->observer_pool, sizeof(struct rx_observer_node));
             if (!node) {
-                LOG_ERROR("Failed to allocate observer node");
+                LOG_ERROR("Failed to allocate observer node from pool");
                 return -1;
             }
             node->next = NULL;
@@ -379,9 +492,9 @@ static int mpsse_buffer_add_write_with_readback(mpsse_context_t *ctx, const uint
 static int mpsse_buffer_add_write_simple(mpsse_context_t *ctx, const uint8_t *tx_data, int tx_bytes,
                                          uint8_t *rx_data, int rx_bytes)
 {
-    struct byte_copier_extra *extra = malloc(sizeof(struct byte_copier_extra));
+    struct byte_copier_extra *extra = pool_alloc(&ctx->observer_pool, sizeof(struct byte_copier_extra));
     if (!extra) {
-        LOG_ERROR("Failed to allocate byte copier extra");
+        LOG_ERROR("Failed to allocate byte copier extra from pool");
         return -1;
     }
     extra->dst = rx_data;
@@ -430,9 +543,9 @@ static int append_tdi_shift(mpsse_context_t *ctx, const uint8_t *tdi, uint8_t *t
     if (inner_end_idx > from_bit_idx && !leading_only) {
         total_inner_bytes = (inner_end_idx - (from_bit_idx + num_leading_bits)) / 8;
         if (total_inner_bytes > 0) {
-            bulk_extra = malloc(sizeof(struct bulk_byte_copier_extra));
+            bulk_extra = pool_alloc(&ctx->observer_pool, sizeof(struct bulk_byte_copier_extra));
             if (!bulk_extra) {
-                LOG_ERROR("Failed to allocate bulk byte copier extra");
+                LOG_ERROR("Failed to allocate bulk byte copier extra from pool");
                 return -1;
             }
             bulk_extra->dst = tdo + (from_bit_idx + num_leading_bits) / 8;
@@ -449,10 +562,9 @@ static int append_tdi_shift(mpsse_context_t *ctx, const uint8_t *tdi, uint8_t *t
                 tdi[from_bit_idx / 8] >> (from_bit_idx % 8),
             };
             
-            struct bit_copier_extra *extra = malloc(sizeof(struct bit_copier_extra));
+            struct bit_copier_extra *extra = pool_alloc(&ctx->observer_pool, sizeof(struct bit_copier_extra));
             if (!extra) {
-                LOG_ERROR("Failed to allocate bit copier extra");
-                free(bulk_extra);
+                LOG_ERROR("Failed to allocate bit copier extra from pool");
                 return -1;
             }
             extra->from_bit = 8 - num_leading_bits;
@@ -461,8 +573,6 @@ static int append_tdi_shift(mpsse_context_t *ctx, const uint8_t *tdi, uint8_t *t
             extra->num_bits = num_leading_bits;
             
             if (mpsse_buffer_add_write_with_readback(ctx, cmd, 3, bit_copier_rx_observer_fn, extra, 1) < 0) {
-                free(extra);
-                free(bulk_extra);
                 return -1;
             }
             cur_idx += num_leading_bits;
@@ -481,32 +591,19 @@ static int append_tdi_shift(mpsse_context_t *ctx, const uint8_t *tdi, uint8_t *t
             bool is_last_chunk = (inner_octets_to_send >= remaining_bytes);
             
             if (mpsse_buffer_append(ctx, cmd, 3, NULL, NULL, 0) < 0) {
-                free(bulk_extra);
                 return -1;
             }
             
             if (is_last_chunk && bulk_extra) {
                 if (mpsse_buffer_add_write_with_readback(ctx, tdi + cur_idx / 8, inner_octets_to_send,
                                                           bulk_byte_copier_rx_observer_fn, bulk_extra, inner_octets_to_send) < 0) {
-                    free(bulk_extra);
                     return -1;
                 }
             } else {
                 if (mpsse_buffer_add_write_simple(ctx, tdi + cur_idx / 8, inner_octets_to_send,
                                                    tdo + cur_idx / 8, inner_octets_to_send) < 0) {
-                    free(bulk_extra);
                     return -1;
                 }
-            }
-            
-            /* CRITICAL: Flush after each chunk to avoid USB bulk write failures
-             * TinyXVC does this implicitly via their buffer management, but we need
-             * to be explicit. This prevents building up huge transfers that exceed
-             * the chip's ability to handle them.
-             */
-            if (mpsse_buffer_flush(ctx) < 0) {
-                free(bulk_extra);
-                return -1;
             }
             
             cur_idx += inner_octets_to_send * 8;
@@ -519,9 +616,9 @@ static int append_tdi_shift(mpsse_context_t *ctx, const uint8_t *tdi, uint8_t *t
                 tdi[inner_end_idx / 8],
             };
             
-            struct bit_copier_extra *extra = malloc(sizeof(struct bit_copier_extra));
+            struct bit_copier_extra *extra = pool_alloc(&ctx->observer_pool, sizeof(struct bit_copier_extra));
             if (!extra) {
-                LOG_ERROR("Failed to allocate bit copier extra");
+                LOG_ERROR("Failed to allocate bit copier extra from pool");
                 return -1;
             }
             extra->from_bit = 8 - num_trailing_bits;
@@ -530,7 +627,6 @@ static int append_tdi_shift(mpsse_context_t *ctx, const uint8_t *tdi, uint8_t *t
             extra->num_bits = num_trailing_bits;
             
             if (mpsse_buffer_add_write_with_readback(ctx, cmd, 3, bit_copier_rx_observer_fn, extra, 1) < 0) {
-                free(extra);
                 return -1;
             }
             cur_idx += num_trailing_bits;
@@ -546,9 +642,9 @@ static int append_tdi_shift(mpsse_context_t *ctx, const uint8_t *tdi, uint8_t *t
                 (last_tdi_bit << 7) | (last_tms_bit << 1) | last_tms_bit,
             };
             
-            struct bit_copier_extra *extra = malloc(sizeof(struct bit_copier_extra));
+            struct bit_copier_extra *extra = pool_alloc(&ctx->observer_pool, sizeof(struct bit_copier_extra));
             if (!extra) {
-                LOG_ERROR("Failed to allocate bit copier extra");
+                LOG_ERROR("Failed to allocate bit copier extra from pool");
                 return -1;
             }
             extra->from_bit = 7;
@@ -557,7 +653,6 @@ static int append_tdi_shift(mpsse_context_t *ctx, const uint8_t *tdi, uint8_t *t
             extra->num_bits = 1;
             
             if (mpsse_buffer_add_write_with_readback(ctx, cmd, 3, bit_copier_rx_observer_fn, extra, 1) < 0) {
-                free(extra);
                 return -1;
             }
             
@@ -750,6 +845,9 @@ int mpsse_adapter_scan(mpsse_context_t *ctx, const uint8_t *tms, const uint8_t *
         LOG_ERROR("MPSSE flush failed");
         return -1;
     }
+    
+    /* Reset memory pool after transaction completes - all observer callbacks done */
+    pool_reset(&ctx->observer_pool);
     
     ctx->state = jtag_state;
     
