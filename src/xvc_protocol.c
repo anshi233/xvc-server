@@ -13,22 +13,23 @@
 #include "logging.h"
 #include "config.h"
 
-/* Helper to dump buffer in trace mode */
+/* Helper to dump buffer in trace mode - DISABLED for performance */
 static void log_buffer(const char *prefix, const uint8_t *buf, int len)
 {
-    if (!log_enabled(XVC_LOG_TRACE)) return;
+    (void)prefix;
+    (void)buf;
+    (void)len;
+    /* Disabled - too slow for high-speed JTAG */
+    return;
+}
 
-    char line[256];
-    int pos = 0;
-    for (int i = 0; i < len; i++) {
-        pos += snprintf(line + pos, sizeof(line) - pos, "%02x ", buf[i]);
-        /* Flush line every 32 bytes or at end */
-        if ((i + 1) % 16 == 0 || i == len - 1) {
-            LOG_TRACE("%s: %s", prefix, line);
-            pos = 0;
-            line[0] = '\0';
-        }
-    }
+/* Profiling helper */
+#include <sys/time.h>
+static inline long long time_us(void)
+{
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (long long)tv.tv_sec * 1000000LL + tv.tv_usec;
 }
 
 /* JTAG state machine transitions */
@@ -235,18 +236,21 @@ int xvc_handle(xvc_context_t *ctx, uint32_t frequency)
         
         /* Handle shift */
         if (memcmp(ctx->cmd_buf, "sh", 2) == 0) {
+            long long t_start = time_us();
+            long long t_read = 0, t_scan = 0, t_write = 0;
+
             if (xvc_read_exact(ctx->socket_fd, ctx->cmd_buf + 2, 4) != 1) {
                 return 1;
             }
             ctx->bytes_rx += 4;
-            
+
             /* Read length */
             if (xvc_read_exact(ctx->socket_fd, ctx->cmd_buf + 6, 4) != 1) {
                 LOG_ERROR("Reading shift length failed");
                 return 1;
             }
             ctx->bytes_rx += 4;
-            
+
             int32_t len = xvc_get_int32(ctx->cmd_buf + 6);
             int nr_bytes = (len + 7) / 8;
 
@@ -254,41 +258,39 @@ int xvc_handle(xvc_context_t *ctx, uint32_t frequency)
                 LOG_ERROR("Vector size exceeded: %d > %d", nr_bytes, ctx->max_vector_size);
                 return -1;
             }
-            
+
             /* Read TMS and TDI data */
             if (xvc_read_exact(ctx->socket_fd, ctx->vector_buf, nr_bytes * 2) != 1) {
                 LOG_ERROR("Reading shift data failed");
                 return 1;
             }
             ctx->bytes_rx += nr_bytes * 2;
-            
+            t_read = time_us();
+
             memset(ctx->result_buf, 0, nr_bytes);
-            
+
             /* Track TLR state for safe client switching */
             ctx->seen_tlr = (ctx->seen_tlr || ctx->jtag_state == JTAG_TEST_LOGIC_RESET) &&
                             (ctx->jtag_state != JTAG_CAPTURE_DR) &&
                             (ctx->jtag_state != JTAG_CAPTURE_IR);
-            
+
             /* Skip bogus state movements (Xilinx impact workaround) */
             bool skip = false;
             if ((ctx->jtag_state == JTAG_EXIT1_IR && len == 5 && ctx->vector_buf[0] == 0x17) ||
                 (ctx->jtag_state == JTAG_EXIT1_DR && len == 4 && ctx->vector_buf[0] == 0x0b)) {
-                LOG_DBG("Ignoring bogus jtag state movement in state %s", 
+                LOG_DBG("Ignoring bogus jtag state movement in state %s",
                           jtag_state_name(ctx->jtag_state));
                 skip = true;
             }
-            
+
             if (!skip) {
                 /* Update JTAG state machine */
                 for (int i = 0; i < len; i++) {
                     int tms = !!(ctx->vector_buf[i / 8] & (1 << (i & 7)));
                     ctx->jtag_state = jtag_step(ctx->jtag_state, tms);
                 }
-                
-                /* Perform scan operation */
-                log_buffer("TMS", ctx->vector_buf, nr_bytes);
-                log_buffer("TDI", ctx->vector_buf + nr_bytes, nr_bytes);
 
+                /* Perform scan operation */
                 /* Use chunked scan if usb_chunk_size is configured */
                 int scan_result;
                 if (ctx->usb_chunk_size > 0) {
@@ -305,15 +307,14 @@ int xvc_handle(xvc_context_t *ctx, uint32_t frequency)
                                                     ctx->result_buf,
                                                     len);
                 }
+                t_scan = time_us();
 
                 if (scan_result < 0) {
                     LOG_ERROR("FTDI scan failed");
                     return -1;
                 }
-
-                log_buffer("TDO", ctx->result_buf, nr_bytes);
             }
-            
+
             /* Send TDO result */
             if (xvc_write_exact(ctx->socket_fd, ctx->result_buf, nr_bytes) < 0) {
                 LOG_ERROR("Write failed for shift result");
@@ -321,6 +322,15 @@ int xvc_handle(xvc_context_t *ctx, uint32_t frequency)
             }
             ctx->bytes_tx += nr_bytes;
             ctx->commands++;
+            t_write = time_us();
+
+            /* Profiling output */
+            long long total = t_write - t_start;
+            long long read_time = t_read - t_start;
+            long long scan_time = t_scan - t_read;
+            long long write_time = t_write - t_scan;
+            LOG_DBG("PROF: len=%d total=%lldus read=%lldus scan=%lldus write=%lldus",
+                    len, total, read_time, scan_time, write_time);
             
         } else {
             LOG_ERROR("Invalid command: '%c%c' (0x%02x 0x%02x)", 

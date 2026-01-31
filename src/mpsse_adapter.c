@@ -303,12 +303,14 @@ static int mpsse_buffer_flush(mpsse_context_t *ctx)
     
     if (b->rx_num_bytes > 0) {
         int bytes_read = 0;
-        int timeout_ms = 1000 + (b->rx_num_bytes * 10);
-        if (timeout_ms < 2000) timeout_ms = 2000;
-        
-        LOG_TRACE("Reading %d bytes with timeout %dms", b->rx_num_bytes, timeout_ms);
-        
-        while (bytes_read < b->rx_num_bytes && timeout_ms > 0) {
+        /* Use a reasonable fixed timeout - data should arrive quickly after TX */
+        int timeout_us = 500000;  /* 500ms max timeout */
+        int spin_count = 0;
+        const int max_spin = 10000;  /* Spin for ~1ms before brief sleep */
+
+        LOG_TRACE("Reading %d bytes with timeout %dus", b->rx_num_bytes, timeout_us);
+
+        while (bytes_read < b->rx_num_bytes && timeout_us > 0) {
             int ret = ftdi_read_data(&ctx->ftdi, b->rx_buffer + bytes_read, b->rx_num_bytes - bytes_read);
             if (ret < 0) {
                 LOG_ERROR("Failed to read from FTDI: %s", ftdi_get_error_string(&ctx->ftdi));
@@ -317,12 +319,19 @@ static int mpsse_buffer_flush(mpsse_context_t *ctx)
             }
             if (ret > 0) {
                 bytes_read += ret;
+                spin_count = 0;  /* Reset spin counter after successful read */
             } else {
-                usleep(1000);
-                timeout_ms--;
+                /* Adaptive polling: spin briefly (no sleep), then brief sleep */
+                if (spin_count < max_spin) {
+                    spin_count++;
+                    /* No sleep - just busy-wait for fast response */
+                } else {
+                    usleep(100);  /* 100us sleep after spinning */
+                    timeout_us -= 100;
+                }
             }
         }
-        
+
         if (bytes_read != b->rx_num_bytes) {
             LOG_ERROR("Only read %d of %d bytes after timeout", bytes_read, b->rx_num_bytes);
             mpsse_chip_recovery(ctx);
