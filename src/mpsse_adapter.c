@@ -77,6 +77,7 @@ struct mpsse_context_s {
     bool last_tdi;
     bool is_open;
     int verbose;
+    int chip_buffer_size;  /* Chip FIFO buffer size: 1024 for FT232H, 4096 for FT2232H */
     char error[256];
 };
 
@@ -111,23 +112,27 @@ mpsse_context_t* mpsse_adapter_create(void)
 {
     mpsse_context_t *ctx = calloc(1, sizeof(mpsse_context_t));
     if (!ctx) return NULL;
-    
-    ctx->buffer.max_tx_buffer_bytes = 3 * 4096;
-    ctx->buffer.max_rx_buffer_bytes = 4096;
-    
+
+    /* Initial buffer allocation with minimum size (1KB for FT232H)
+     * Buffers will be reallocated in mpsse_adapter_open based on actual chip type
+     */
+    ctx->buffer.max_tx_buffer_bytes = 3 * 1024;
+    ctx->buffer.max_rx_buffer_bytes = 1024;
+
     ctx->buffer.tx_buffer = malloc(ctx->buffer.max_tx_buffer_bytes);
     ctx->buffer.rx_buffer = malloc(ctx->buffer.max_rx_buffer_bytes);
-    
+
     if (!ctx->buffer.tx_buffer || !ctx->buffer.rx_buffer) {
         free(ctx->buffer.tx_buffer);
         free(ctx->buffer.rx_buffer);
         free(ctx);
         return NULL;
     }
-    
+
     ctx->state = TEST_LOGIC_RESET;
     ctx->last_tdi = 0;
-    
+    ctx->chip_buffer_size = 1024;  /* Default to minimum (FT232H) */
+
     return ctx;
 }
 
@@ -170,6 +175,47 @@ static enum jtag_state next_state(enum jtag_state curState, bool tmsHigh)
     return RUN_TEST_IDLE;
 }
 
+static int mpsse_chip_recovery(mpsse_context_t *ctx)
+{
+    if (!ctx || !ctx->is_open) return -1;
+    
+    LOG_WARN("Attempting chip recovery...");
+    
+    uint8_t reset_cmds[] = {
+        OP_LOOPBACK_OFF,
+        OP_SET_TCK_DIVISOR,
+        29 & 0xFF,
+        (29 >> 8) & 0xFF,
+        OP_DISABLE_CLK_DIVIDE_BY_5,
+    };
+    
+    ftdi_usb_reset(&ctx->ftdi);
+    ftdi_tcioflush(&ctx->ftdi);
+    
+    if (ftdi_set_bitmode(&ctx->ftdi, 0x00, BITMODE_RESET) < 0) {
+        LOG_ERROR("Failed to reset bitmode during recovery");
+        return -1;
+    }
+    
+    if (ftdi_set_bitmode(&ctx->ftdi, 0x00, BITMODE_MPSSE) < 0) {
+        LOG_ERROR("Failed to set MPSSE mode during recovery");
+        return -1;
+    }
+    
+    usleep(10000);
+    
+    if (ftdi_write_data(&ctx->ftdi, reset_cmds, sizeof(reset_cmds)) < 0) {
+        LOG_ERROR("Failed to write recovery commands");
+        return -1;
+    }
+    
+    uint8_t junk[256];
+    ftdi_read_data(&ctx->ftdi, junk, sizeof(junk));
+    
+    LOG_INFO("Chip recovery completed");
+    return 0;
+}
+
 static int mpsse_buffer_flush(mpsse_context_t *ctx)
 {
     struct mpsse_buffer *b = &ctx->buffer;
@@ -178,10 +224,12 @@ static int mpsse_buffer_flush(mpsse_context_t *ctx)
         int ret = ftdi_write_data(&ctx->ftdi, b->tx_buffer, b->tx_num_bytes);
         if (ret < 0) {
             LOG_ERROR("Failed to write to FTDI: %s", ftdi_get_error_string(&ctx->ftdi));
+            mpsse_chip_recovery(ctx);
             return -1;
         }
         if (ret != b->tx_num_bytes) {
             LOG_ERROR("Only wrote %d of %d bytes", ret, b->tx_num_bytes);
+            mpsse_chip_recovery(ctx);
             return -1;
         }
         b->tx_num_bytes = 0;
@@ -189,12 +237,16 @@ static int mpsse_buffer_flush(mpsse_context_t *ctx)
     
     if (b->rx_num_bytes > 0) {
         int bytes_read = 0;
-        int timeout_ms = 1000;
+        int timeout_ms = 1000 + (b->rx_num_bytes * 10);
+        if (timeout_ms < 2000) timeout_ms = 2000;
+        
+        LOG_TRACE("Reading %d bytes with timeout %dms", b->rx_num_bytes, timeout_ms);
         
         while (bytes_read < b->rx_num_bytes && timeout_ms > 0) {
             int ret = ftdi_read_data(&ctx->ftdi, b->rx_buffer + bytes_read, b->rx_num_bytes - bytes_read);
             if (ret < 0) {
                 LOG_ERROR("Failed to read from FTDI: %s", ftdi_get_error_string(&ctx->ftdi));
+                mpsse_chip_recovery(ctx);
                 return -1;
             }
             if (ret > 0) {
@@ -207,6 +259,7 @@ static int mpsse_buffer_flush(mpsse_context_t *ctx)
         
         if (bytes_read != b->rx_num_bytes) {
             LOG_ERROR("Only read %d of %d bytes after timeout", bytes_read, b->rx_num_bytes);
+            mpsse_chip_recovery(ctx);
             return -1;
         }
         
@@ -245,12 +298,31 @@ static void byte_copier_rx_observer_fn(const uint8_t *rxData, void *extra)
     memcpy(e->dst, rxData, e->num_bytes);
 }
 
+struct bulk_byte_copier_extra {
+    uint8_t *dst;
+    int total_bytes;
+    int bytes_copied;
+};
+
+static void bulk_byte_copier_rx_observer_fn(const uint8_t *rxData, void *extra)
+{
+    struct bulk_byte_copier_extra *e = extra;
+    memcpy(e->dst + e->bytes_copied, rxData, e->total_bytes - e->bytes_copied);
+    e->bytes_copied = e->total_bytes;
+}
+
 static int mpsse_buffer_ensure_can_append(mpsse_context_t *ctx, int tx_bytes, int rx_bytes)
 {
     struct mpsse_buffer *b = &ctx->buffer;
     
     if (b->tx_num_bytes + tx_bytes > b->max_tx_buffer_bytes ||
         b->rx_num_bytes + rx_bytes > b->max_rx_buffer_bytes) {
+        if (mpsse_buffer_flush(ctx) < 0) {
+            return -1;
+        }
+    }
+    
+    if (tx_bytes > 512 || rx_bytes > 512) {
         if (mpsse_buffer_flush(ctx) < 0) {
             return -1;
         }
@@ -352,6 +424,23 @@ static int append_tdi_shift(mpsse_context_t *ctx, const uint8_t *tdi, uint8_t *t
     const int num_trailing_bits = leading_only ? 0 : last_bit_idx % 8;
     (void)leading_only;
     
+    struct bulk_byte_copier_extra *bulk_extra = NULL;
+    int total_inner_bytes = 0;
+    
+    if (inner_end_idx > from_bit_idx && !leading_only) {
+        total_inner_bytes = (inner_end_idx - (from_bit_idx + num_leading_bits)) / 8;
+        if (total_inner_bytes > 0) {
+            bulk_extra = malloc(sizeof(struct bulk_byte_copier_extra));
+            if (!bulk_extra) {
+                LOG_ERROR("Failed to allocate bulk byte copier extra");
+                return -1;
+            }
+            bulk_extra->dst = tdo + (from_bit_idx + num_leading_bits) / 8;
+            bulk_extra->total_bytes = total_inner_bytes;
+            bulk_extra->bytes_copied = 0;
+        }
+    }
+    
     for (int cur_idx = from_bit_idx; cur_idx < to_bit_idx;) {
         if (cur_idx == from_bit_idx && num_leading_bits > 0) {
             uint8_t cmd[] = {
@@ -363,6 +452,7 @@ static int append_tdi_shift(mpsse_context_t *ctx, const uint8_t *tdi, uint8_t *t
             struct bit_copier_extra *extra = malloc(sizeof(struct bit_copier_extra));
             if (!extra) {
                 LOG_ERROR("Failed to allocate bit copier extra");
+                free(bulk_extra);
                 return -1;
             }
             extra->from_bit = 8 - num_leading_bits;
@@ -372,13 +462,14 @@ static int append_tdi_shift(mpsse_context_t *ctx, const uint8_t *tdi, uint8_t *t
             
             if (mpsse_buffer_add_write_with_readback(ctx, cmd, 3, bit_copier_rx_observer_fn, extra, 1) < 0) {
                 free(extra);
+                free(bulk_extra);
                 return -1;
             }
             cur_idx += num_leading_bits;
         }
         
         if (cur_idx < last_bit_idx && inner_end_idx > cur_idx) {
-            const int inner_octets_to_send = min((inner_end_idx - cur_idx) / 8, 4096);
+            const int inner_octets_to_send = min((inner_end_idx - cur_idx) / 8, ctx->chip_buffer_size);
             
             uint8_t cmd[] = {
                 OP_SHIFT_RD_TDO_FLAG | OP_SHIFT_WR_TDI_FLAG | OP_SHIFT_LSB_FIRST_FLAG | OP_SHIFT_WR_FALLING_FLAG,
@@ -386,14 +477,38 @@ static int append_tdi_shift(mpsse_context_t *ctx, const uint8_t *tdi, uint8_t *t
                 ((inner_octets_to_send - 1) >> 8) & 0xff,
             };
             
+            int remaining_bytes = total_inner_bytes - (cur_idx - (from_bit_idx + num_leading_bits)) / 8;
+            bool is_last_chunk = (inner_octets_to_send >= remaining_bytes);
+            
             if (mpsse_buffer_append(ctx, cmd, 3, NULL, NULL, 0) < 0) {
+                free(bulk_extra);
                 return -1;
             }
             
-            if (mpsse_buffer_add_write_simple(ctx, tdi + cur_idx / 8, inner_octets_to_send,
-                                               tdo + cur_idx / 8, inner_octets_to_send) < 0) {
+            if (is_last_chunk && bulk_extra) {
+                if (mpsse_buffer_add_write_with_readback(ctx, tdi + cur_idx / 8, inner_octets_to_send,
+                                                          bulk_byte_copier_rx_observer_fn, bulk_extra, inner_octets_to_send) < 0) {
+                    free(bulk_extra);
+                    return -1;
+                }
+            } else {
+                if (mpsse_buffer_add_write_simple(ctx, tdi + cur_idx / 8, inner_octets_to_send,
+                                                   tdo + cur_idx / 8, inner_octets_to_send) < 0) {
+                    free(bulk_extra);
+                    return -1;
+                }
+            }
+            
+            /* CRITICAL: Flush after each chunk to avoid USB bulk write failures
+             * TinyXVC does this implicitly via their buffer management, but we need
+             * to be explicit. This prevents building up huge transfers that exceed
+             * the chip's ability to handle them.
+             */
+            if (mpsse_buffer_flush(ctx) < 0) {
+                free(bulk_extra);
                 return -1;
             }
+            
             cur_idx += inner_octets_to_send * 8;
         }
         
@@ -472,13 +587,54 @@ int mpsse_adapter_open(mpsse_context_t *ctx, int vendor, int product, const char
         LOG_ERROR("Failed to open FTDI device: %s", ftdi_get_error_string(&ctx->ftdi));
         return -1;
     }
-    
+
+    /* Detect chip type and set appropriate buffer sizes
+     * FT2232H has 4KB buffer, FT232H has 1KB buffer
+     */
+    int chip_buffer_size = 4096;  /* Default for FT2232H */
+    const char *chip_name = "FT2232H";
+
+    if (ctx->ftdi.type == TYPE_232H) {
+        chip_buffer_size = 1024;  /* FT232H has 1KB buffer */
+        chip_name = "FT232H";
+    }
+
+    /* Store chip buffer size for use in shift operations */
+    ctx->chip_buffer_size = chip_buffer_size;
+
+    /* Reallocate buffers with correct size for the chip */
+    ctx->buffer.max_tx_buffer_bytes = 3 * chip_buffer_size;
+    ctx->buffer.max_rx_buffer_bytes = chip_buffer_size;
+
+    free(ctx->buffer.tx_buffer);
+    free(ctx->buffer.rx_buffer);
+
+    ctx->buffer.tx_buffer = malloc(ctx->buffer.max_tx_buffer_bytes);
+    ctx->buffer.rx_buffer = malloc(ctx->buffer.max_rx_buffer_bytes);
+
+    if (!ctx->buffer.tx_buffer || !ctx->buffer.rx_buffer) {
+        LOG_ERROR("Failed to allocate buffers for %s", chip_name);
+        free(ctx->buffer.tx_buffer);
+        free(ctx->buffer.rx_buffer);
+        ctx->buffer.tx_buffer = NULL;
+        ctx->buffer.rx_buffer = NULL;
+        return -1;
+    }
+
+    LOG_INFO("Detected %s chip, using %d byte buffer", chip_name, chip_buffer_size);
+
     ftdi_usb_reset(&ctx->ftdi);
-    ftdi_set_baudrate(&ctx->ftdi, 115200);
-    ftdi_set_latency_timer(&ctx->ftdi, MPSSE_DEFAULT_LATENCY);
     ftdi_setflowctrl(&ctx->ftdi, SIO_RTS_CTS_HS);
+    ftdi_set_baudrate(&ctx->ftdi, 115200);
     ftdi_set_bitmode(&ctx->ftdi, 0x00, BITMODE_RESET);
     ftdi_set_bitmode(&ctx->ftdi, 0x00, BITMODE_MPSSE);
+    
+    int ret = ftdi_set_latency_timer(&ctx->ftdi, MPSSE_DEFAULT_LATENCY);
+    if (ret < 0) {
+        LOG_WARN("Failed to set latency timer: %d (continuing anyway)", ret);
+    } else {
+        LOG_DBG("Latency timer set to %dms", MPSSE_DEFAULT_LATENCY);
+    }
     
     uint8_t setup_cmds[] = {
         OP_LOOPBACK_OFF,
