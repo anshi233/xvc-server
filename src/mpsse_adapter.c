@@ -947,6 +947,54 @@ int mpsse_adapter_set_frequency(mpsse_context_t *ctx, uint32_t frequency_hz)
     return actual;
 }
 
+int mpsse_adapter_set_buffer_size(mpsse_context_t *ctx, int buffer_size)
+{
+    if (!ctx || !ctx->is_open) return -1;
+    
+    /* Validate buffer size */
+    if (buffer_size < 2048 || buffer_size > 131072) {
+        LOG_ERROR("Invalid buffer size %d (must be 2048-131072 bytes)", buffer_size);
+        return -1;
+    }
+    
+    /* Flush any pending data before reallocation */
+    if (mpsse_buffer_flush(ctx) < 0) {
+        LOG_ERROR("Failed to flush before buffer resize");
+        return -1;
+    }
+    
+    /* Reallocate buffers with new size */
+    free(ctx->buffer.tx_buffer);
+    free(ctx->buffer.rx_buffer);
+    
+    /* TX buffer needs to be 3x buffer size to accommodate multiple commands */
+    ctx->buffer.max_tx_buffer_bytes = 3 * buffer_size;
+    ctx->buffer.max_rx_buffer_bytes = buffer_size;
+    
+    ctx->buffer.tx_buffer = malloc(ctx->buffer.max_tx_buffer_bytes);
+    ctx->buffer.rx_buffer = malloc(ctx->buffer.max_rx_buffer_bytes);
+    
+    if (!ctx->buffer.tx_buffer || !ctx->buffer.rx_buffer) {
+        LOG_ERROR("Failed to allocate buffers (tx=%d, rx=%d bytes)",
+                  ctx->buffer.max_tx_buffer_bytes, ctx->buffer.max_rx_buffer_bytes);
+        free(ctx->buffer.tx_buffer);
+        free(ctx->buffer.rx_buffer);
+        ctx->buffer.tx_buffer = NULL;
+        ctx->buffer.rx_buffer = NULL;
+        return -1;
+    }
+    
+    ctx->buffer.tx_num_bytes = 0;
+    ctx->buffer.rx_num_bytes = 0;
+    ctx->buffer.rx_observer_first = NULL;
+    ctx->buffer.rx_observer_last = NULL;
+    
+    LOG_INFO("MPSSE buffer size set to %d bytes (tx=%d, rx=%d)",
+             buffer_size, ctx->buffer.max_tx_buffer_bytes, ctx->buffer.max_rx_buffer_bytes);
+    
+    return 0;
+}
+
 int mpsse_adapter_scan(mpsse_context_t *ctx, const uint8_t *tms, const uint8_t *tdi,
                         uint8_t *tdo, int bits)
 {

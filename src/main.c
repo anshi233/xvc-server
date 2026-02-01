@@ -77,7 +77,7 @@ static int on_client_data(void *user_data, tcp_connection_t *conn)
     
     /* Initialize XVC context for this connection if needed */
     if (ctx->xvc.socket_fd != conn->fd) {
-        xvc_init(&ctx->xvc, conn->fd, ctx->ftdi);
+        xvc_init(&ctx->xvc, conn->fd, ctx->ftdi, ctx->config->xvc_buffer_size);
     }
     
     /* Handle XVC protocol */
@@ -164,6 +164,14 @@ static int run_instance(xvc_instance_config_t *inst_config)
     }
     if (inst_config->latency_timer > 0) {
         ftdi_adapter_set_latency(ctx.ftdi, inst_config->latency_timer);
+    }
+    
+    /* Set buffer size if configured */
+    if (inst_config->xvc_buffer_size != DEFAULT_XVC_BUFFER_SIZE) {
+        if (ftdi_adapter_set_buffer_size(ctx.ftdi, inst_config->xvc_buffer_size) < 0) {
+            LOG_WARN("Failed to set buffer size to %d, using default",
+                     inst_config->xvc_buffer_size);
+        }
     }
     
     /* Load whitelist */

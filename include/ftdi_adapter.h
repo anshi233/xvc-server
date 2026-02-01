@@ -121,6 +121,14 @@ int ftdi_adapter_set_period(ftdi_context_t *ctx, unsigned int period_ns);
 int ftdi_adapter_set_frequency(ftdi_context_t *ctx, uint32_t frequency_hz);
 
 /**
+ * Set buffer size for operations
+ * @param ctx FTDI context
+ * @param buffer_size Buffer size in bytes (2048 to 131072)
+ * @return 0 on success, -1 on error
+ */
+int ftdi_adapter_set_buffer_size(ftdi_context_t *ctx, int buffer_size);
+
+/**
  * Perform JTAG scan operation
  * @param ctx FTDI context
  * @param tms TMS data bytes

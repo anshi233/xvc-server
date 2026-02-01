@@ -329,6 +329,18 @@ int ftdi_adapter_set_frequency(ftdi_context_t *ctx, uint32_t frequency_hz)
     return (actual > 0) ? 0 : -1;
 }
 
+int ftdi_adapter_set_buffer_size(ftdi_context_t *ctx, int buffer_size)
+{
+    if (!ctx) return -1;
+    
+    if (ctx->mode == ADAPTER_MODE_MPSSE && ctx->mpsse) {
+        return mpsse_adapter_set_buffer_size(ctx->mpsse, buffer_size);
+    }
+    
+    LOG_WARN("Buffer size setting not supported in bitbang mode");
+    return -1;
+}
+
 int ftdi_adapter_scan(ftdi_context_t *ctx,
                       const uint8_t *tms,
                       const uint8_t *tdi,

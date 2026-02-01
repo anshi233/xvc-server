@@ -12,8 +12,11 @@
 /* XVC protocol version */
 #define XVC_VERSION "xvcServer_v1.0"
 
-/* Maximum vector size in bytes (TMS + TDI combined) */
+/* Maximum vector size in bytes (TMS + TDI combined) - legacy default */
 #define XVC_MAX_VECTOR_SIZE 2048
+
+/* Maximum supported buffer size (128KB as per Xilinx spec) */
+#define XVC_MAX_SUPPORTED_BUFFER_SIZE 131072
 
 /* JTAG states */
 typedef enum {
@@ -53,14 +56,15 @@ typedef struct {
     jtag_state_t jtag_state;
     bool seen_tlr;          /* Seen test-logic-reset */
     uint32_t frequency;     /* Current TCK frequency */
+    int max_vector_size;    /* Configured maximum vector size */
     
     /* FTDI adapter reference */
     struct ftdi_context_s *ftdi;
     
-    /* Buffers */
+    /* Buffers - dynamically allocated based on max_vector_size */
     uint8_t cmd_buf[16];
-    uint8_t vector_buf[XVC_MAX_VECTOR_SIZE];
-    uint8_t result_buf[XVC_MAX_VECTOR_SIZE];
+    uint8_t *vector_buf;    /* TMS + TDI data */
+    uint8_t *result_buf;    /* TDO result */
     
     /* Statistics */
     uint64_t bytes_rx;
@@ -75,9 +79,10 @@ typedef struct {
  * @param ctx XVC context
  * @param socket_fd Client socket
  * @param ftdi FTDI adapter context
+ * @param max_vector_size Maximum vector size in bytes (0 for default 2048)
  * @return 0 on success, -1 on error
  */
-int xvc_init(xvc_context_t *ctx, int socket_fd, struct ftdi_context_s *ftdi);
+int xvc_init(xvc_context_t *ctx, int socket_fd, struct ftdi_context_s *ftdi, int max_vector_size);
 
 /**
  * Handle incoming data from client

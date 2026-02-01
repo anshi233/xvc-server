@@ -113,7 +113,7 @@ const char* jtag_state_name(jtag_state_t state)
     return "UNKNOWN";
 }
 
-int xvc_init(xvc_context_t *ctx, int socket_fd, struct ftdi_context_s *ftdi)
+int xvc_init(xvc_context_t *ctx, int socket_fd, struct ftdi_context_s *ftdi, int max_vector_size)
 {
     if (!ctx) return -1;
     
@@ -123,12 +123,40 @@ int xvc_init(xvc_context_t *ctx, int socket_fd, struct ftdi_context_s *ftdi)
     ctx->jtag_state = JTAG_TEST_LOGIC_RESET;
     ctx->seen_tlr = false;
     
+    /* Set max vector size (use provided or default) */
+    if (max_vector_size <= 0 || max_vector_size > XVC_MAX_SUPPORTED_BUFFER_SIZE) {
+        ctx->max_vector_size = XVC_MAX_VECTOR_SIZE;
+        LOG_WARN("Invalid max_vector_size %d, using default %d",
+                 max_vector_size, XVC_MAX_VECTOR_SIZE);
+    } else {
+        ctx->max_vector_size = max_vector_size;
+        LOG_INFO("XVC buffer size set to %d bytes", ctx->max_vector_size);
+    }
+    
+    /* Allocate buffers based on configured size */
+    ctx->vector_buf = malloc(ctx->max_vector_size * 2);  /* TMS + TDI */
+    ctx->result_buf = malloc(ctx->max_vector_size);        /* TDO */
+    
+    if (!ctx->vector_buf || !ctx->result_buf) {
+        LOG_ERROR("Failed to allocate XVC buffers (%d bytes)", ctx->max_vector_size);
+        free(ctx->vector_buf);
+        free(ctx->result_buf);
+        return -1;
+    }
+    
+    LOG_INFO("XVC context initialized: buffer_size=%d bytes", ctx->max_vector_size);
     return 0;
 }
 
 void xvc_close(xvc_context_t *ctx)
 {
     if (!ctx) return;
+    
+    /* Free dynamic buffers */
+    free(ctx->vector_buf);
+    free(ctx->result_buf);
+    ctx->vector_buf = NULL;
+    ctx->result_buf = NULL;
     
     LOG_DBG("XVC session closed: rx=%lu tx=%lu cmds=%lu",
               ctx->bytes_rx, ctx->bytes_tx, ctx->commands);
@@ -139,7 +167,7 @@ int xvc_handle(xvc_context_t *ctx, uint32_t frequency)
     if (!ctx) return -1;
     
     char xvc_info[64];
-    snprintf(xvc_info, sizeof(xvc_info), "%s:%d\n", XVC_VERSION, XVC_MAX_VECTOR_SIZE);
+    snprintf(xvc_info, sizeof(xvc_info), "%s:%d\n", XVC_VERSION, ctx->max_vector_size);
     
     do {
         /* Read command (first 2 bytes) */
@@ -214,8 +242,8 @@ int xvc_handle(xvc_context_t *ctx, uint32_t frequency)
             int32_t len = xvc_get_int32(ctx->cmd_buf + 6);
             int nr_bytes = (len + 7) / 8;
             
-            if (nr_bytes > XVC_MAX_VECTOR_SIZE) {
-                LOG_ERROR("Vector size exceeded: %d", nr_bytes);
+            if (nr_bytes > ctx->max_vector_size) {
+                LOG_ERROR("Vector size exceeded: %d (max=%d)", nr_bytes, ctx->max_vector_size);
                 return -1;
             }
             
