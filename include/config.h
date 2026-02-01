@@ -18,11 +18,12 @@
 #define MAX_IP_LEN          46  /* IPv6 max length */
 
 /* Default values */
-#define DEFAULT_BASE_PORT       2542
-#define DEFAULT_FREQUENCY       10000000  /* 10 MHz */
-#define DEFAULT_LATENCY         1         /* ms */
-#define DEFAULT_XVC_BUFFER_SIZE 2048      /* 2KB default, up to 128KB */
-#define MAX_XVC_BUFFER_SIZE     131072    /* 128KB maximum */
+#define DEFAULT_BASE_PORT   2542
+#define DEFAULT_FREQUENCY   10000000  /* 10 MHz */
+#define DEFAULT_LATENCY     1         /* ms */
+#define DEFAULT_XVC_BUFFER_SIZE 2048      /* Default XVC buffer size in bytes */
+#define MIN_XVC_BUFFER_SIZE     64        /* Minimum XVC buffer size */
+#define MAX_XVC_BUFFER_SIZE     536870912 /* Maximum XVC buffer size: 512MB */
 
 /* Device ID types */
 typedef enum {
@@ -71,13 +72,16 @@ typedef struct {
     int latency_timer;      /* FTDI latency timer in ms */
     bool async_mode;        /* Use async FTDI operations */
     jtag_mode_t jtag_mode;  /* JTAG adapter mode (MPSSE or bitbang) */
-    int xvc_buffer_size;    /* XVC buffer size in bytes (2KB to 128KB) */
     
     /* Whitelist settings */
     whitelist_mode_t whitelist_mode;
     whitelist_entry_t whitelist[MAX_WHITELIST_ENTRIES];
     int whitelist_count;
-    
+
+    /* XVC buffer settings */
+    int xvc_buffer_size;    /* XVC max vector size in bytes */
+    int usb_chunk_size;     /* USB transfer chunk size for splitting large messages */
+
     /* Runtime state */
     bool enabled;
     pid_t pid;              /* Child process PID */

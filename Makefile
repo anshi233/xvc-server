@@ -3,10 +3,6 @@
 # Two binaries: xvc-discover and xvc-server
 # All external libraries are local (vendor/), only stdlib from system
 
-# Parallel build threads (for vendor libs, supports make -jN)
-# Note: Use 'make -j8' or 'make -j$(THREADS)' for parallel builds
-THREADS ?= 8
-
 # Detect architecture
 ARCH ?= $(shell uname -m)
 CROSS_COMPILE ?=
@@ -33,7 +29,7 @@ else
     # Use local vendor libraries (static linking)
     VENDOR_LIBUSB = ./vendor/libusb/install
     VENDOR_LIBFTDI = ./vendor/libftdi1/install
-    CFLAGS += -I$(VENDOR_LIBFTDI)/include/libftdi1 -I$(VENDOR_LIBUSB)/include
+    CFLAGS += -I$(VENDOR_LIBFTDI)/include/libftdi1 -I$(VENDOR_LIBUSB)/include/libusb-1.0
     LDFLAGS_SERVER = $(VENDOR_LIBFTDI)/lib/libftdi1.a $(VENDOR_LIBUSB)/lib/libusb-1.0.a -lpthread -lm
     LDFLAGS_DISCOVER = $(VENDOR_LIBUSB)/lib/libusb-1.0.a -lpthread
 endif
@@ -63,8 +59,6 @@ SERVER_SOURCES = $(SRC_DIR)/main.c \
                   $(SRC_DIR)/xvc_protocol.c \
                   $(SRC_DIR)/ftdi_adapter.c \
                   $(SRC_DIR)/mpsse_adapter.c \
-                  $(SRC_DIR)/usb_layer.c \
-                  $(SRC_DIR)/async_usb.c \
                   $(SRC_DIR)/config.c \
                   $(SRC_DIR)/whitelist.c \
                   $(SRC_DIR)/logging.c
@@ -100,6 +94,7 @@ dirs:
 	@mkdir -p $(VENDOR_DIR)
 
 # Build vendor libraries
+# Build vendor libraries
 vendor-lib: libusb-build libftdi-build
 
 libusb-build:
@@ -108,10 +103,9 @@ libusb-build:
 		echo "Configuring libusb..."; \
 		cd $(VENDOR_DIR)/libusb && CFLAGS="-fPIC" ./configure --prefix=$(ABS_VENDOR_DIR)/libusb/install --enable-static --disable-shared --disable-udev; \
 	fi
-	@cd $(VENDOR_DIR)/libusb && $(MAKE) -j$(THREADS)
-	@$(MAKE) -C $(VENDOR_DIR)/libusb install
+	@cd $(VENDOR_DIR)/libusb && $(MAKE) && $(MAKE) install
 
-libftdi-build: libusb-build
+libftdi-build:
 	@echo "Building libftdi1 (static only)..."
 	@mkdir -p $(VENDOR_DIR)/libftdi1/build
 	@cd $(VENDOR_DIR)/libftdi1/build && cmake .. \
@@ -120,12 +114,12 @@ libftdi-build: libusb-build
 		-DLIBUSB_LIBRARIES=$(ABS_VENDOR_DIR)/libusb/install/lib/libusb-1.0.a \
 		-DFTDI_EEPROM=OFF -DDOCUMENTATION=OFF -DEXAMPLES=OFF \
 		-DPYTHON_BINDINGS=OFF -DFTDIPP=OFF -DBUILD_TESTS=OFF \
-		-DSTATICLIBS=ON
-	@$(MAKE) -C $(VENDOR_DIR)/libftdi1/build -j$(THREADS) ftdi1-static
-	@mkdir -p $(ABS_VENDOR_DIR)/libftdi1/install/lib
-	@mkdir -p $(ABS_VENDOR_DIR)/libftdi1/install/include/libftdi1
-	@cp $(VENDOR_DIR)/libftdi1/build/src/libftdi1.a $(ABS_VENDOR_DIR)/libftdi1/install/lib/
-	@cp $(VENDOR_DIR)/libftdi1/src/ftdi.h $(ABS_VENDOR_DIR)/libftdi1/install/include/libftdi1/
+		-DSTATICLIBS=ON && \
+	$(MAKE) ftdi1-static && \
+	mkdir -p $(ABS_VENDOR_DIR)/libftdi1/install/lib && \
+	mkdir -p $(ABS_VENDOR_DIR)/libftdi1/install/include/libftdi1 && \
+	cp src/libftdi1.a $(ABS_VENDOR_DIR)/libftdi1/install/lib/ && \
+	cp ../src/ftdi.h $(ABS_VENDOR_DIR)/libftdi1/install/include/libftdi1/
 
 # Clean vendor libraries (delete directly to avoid path issues from cross-machine copies)
 vendor-clean:
@@ -138,42 +132,24 @@ vendor-clean:
 	@echo "Vendor libraries cleaned"
 
 # Link xvc-server
-$(TARGET_SERVER): $(SERVER_OBJECTS) | vendor-lib
+$(TARGET_SERVER): $(SERVER_OBJECTS)
 	@echo "Linking xvc-server..."
 	$(CC) $(SERVER_OBJECTS) -o $@ $(LDFLAGS_SERVER)
 	@echo "Build complete: $@"
 
 # Link xvc-discover
-$(TARGET_DISCOVER): $(DISCOVER_OBJECTS) | vendor-lib
+$(TARGET_DISCOVER): $(DISCOVER_OBJECTS)
 	@echo "Linking xvc-discover..."
 	$(CC) $(DISCOVER_OBJECTS) -o $@ $(LDFLAGS_DISCOVER)
 	@echo "Build complete: $@"
 
 # Compile xvc-server source files
-$(OBJ_DIR)/main.o $(OBJ_DIR)/tcp_server.o $(OBJ_DIR)/xvc_protocol.o $(OBJ_DIR)/ftdi_adapter.o $(OBJ_DIR)/mpsse_adapter.o $(OBJ_DIR)/usb_layer.o $(OBJ_DIR)/async_usb.o $(OBJ_DIR)/whitelist.o: $(OBJ_DIR)/%.o: $(SRC_DIR)/%.c | vendor-lib
+$(OBJ_DIR)/%.o: $(SRC_DIR)/%.c
 	@echo "Compiling $<..."
 	$(CC) $(CFLAGS) -c $< -o $@
 
-# Compile shared source files for xvc-server
-$(OBJ_DIR)/device_manager.o $(OBJ_DIR)/config.o $(OBJ_DIR)/logging.o: $(OBJ_DIR)/%.o: $(SRC_DIR)/%.c | vendor-lib
-	@echo "Compiling $<..."
-	$(CC) $(CFLAGS) -c $< -o $@
-
-# Compile xvc-discover specific source file
-$(OBJ_DIR)/discover_discover_main.o: $(SRC_DIR)/discover_main.c | vendor-lib
-	@echo "Compiling $< (for xvc-discover)..."
-	$(CC) $(CFLAGS) -c $< -o $@
-
-# Compile shared source files for xvc-discover (separate objects)
-$(OBJ_DIR)/discover_device_manager.o: $(SRC_DIR)/device_manager.c | vendor-lib
-	@echo "Compiling $< (for xvc-discover)..."
-	$(CC) $(CFLAGS) -c $< -o $@
-
-$(OBJ_DIR)/discover_config.o: $(SRC_DIR)/config.c | vendor-lib
-	@echo "Compiling $< (for xvc-discover)..."
-	$(CC) $(CFLAGS) -c $< -o $@
-
-$(OBJ_DIR)/discover_logging.o: $(SRC_DIR)/logging.c | vendor-lib
+# Compile xvc-discover source files (with prefix)
+$(OBJ_DIR)/discover_%.o: $(SRC_DIR)/%.c
 	@echo "Compiling $< (for xvc-discover)..."
 	$(CC) $(CFLAGS) -c $< -o $@
 
@@ -250,8 +226,6 @@ test: $(TARGET_SERVER) $(TARGET_DISCOVER)
 	$(TARGET_SERVER) --help
 	@echo "Tests passed"
 
-.PHONY: all dirs vendor-lib vendor-clean xvc-server xvc-discover install install-server install-discover install-systemd uninstall clean distclean rebuild test help
-
 # Show help
 help:
 	@echo "XVC Server Makefile"
@@ -275,16 +249,15 @@ help:
 	@echo "  rebuild          - Clean and rebuild everything"
 	@echo ""
 	@echo "Options:"
-	@echo "  DEBUG=1           - Build with debug symbols"
-	@echo "  ARCH=arm64        - Set target architecture"
+	@echo "  DEBUG=1    - Build with debug symbols"
+	@echo "  ARCH=arm64 - Set target architecture"
 	@echo "  CROSS_COMPILE=aarch64-linux-gnu- - Cross-compile"
-	@echo "  THREADS=8         - Set parallel build threads for vendor libs (default: 8)"
 	@echo ""
 	@echo "Usage Examples:"
-	@echo "  make -j8                  # Build everything with 8 parallel jobs (recommended)"
-	@echo "  make -j4                  # Build with 4 parallel jobs"
-	@echo "  make                      # Build serially"
-	@echo "  make vendor-lib THREADS=8 # Build vendor libs with 8 threads"
-	@echo "  make xvc-discover         # Build discovery tool only"
-	@echo "  make install-server       # Install xvc-server"
+	@echo "  make                    # Build everything (vendor libs + binaries)"
+	@echo "  make vendor-lib         # Build vendor libraries only"
+	@echo "  make xvc-discover       # Build discovery tool only"
+	@echo "  make install-server     # Install xvc-server"
 	@echo "  make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu-"
+
+.PHONY: all dirs vendor-lib vendor-clean xvc-server xvc-discover install install-server install-discover install-systemd uninstall clean distclean rebuild test help

@@ -63,8 +63,9 @@ void config_init(xvc_global_config_t *config)
         config->instances[i].latency_timer = DEFAULT_LATENCY;
         config->instances[i].async_mode = false;
         config->instances[i].jtag_mode = JTAG_MODE_MPSSE;  /* Default to fast MPSSE mode */
-        config->instances[i].xvc_buffer_size = DEFAULT_XVC_BUFFER_SIZE;
         config->instances[i].whitelist_mode = WHITELIST_OFF;
+        config->instances[i].xvc_buffer_size = DEFAULT_XVC_BUFFER_SIZE;
+        config->instances[i].usb_chunk_size = 0;  /* 0 = auto (use chip buffer size) */
         config->instances[i].enabled = false;
     }
 }
@@ -215,14 +216,19 @@ int config_load(xvc_global_config_t *config, const char *path)
                                 inst->jtag_mode = JTAG_MODE_MPSSE;  /* default */
                             }
                         } else if (strcmp(setting, "xvc_buffer_size") == 0) {
-                            int size = atoi(value);
-                            if (size >= 2048 && size <= MAX_XVC_BUFFER_SIZE) {
-                                inst->xvc_buffer_size = size;
-                            } else {
-                                LOG_WARN("Invalid xvc_buffer_size %d, using default %d",
-                                         size, DEFAULT_XVC_BUFFER_SIZE);
-                                inst->xvc_buffer_size = DEFAULT_XVC_BUFFER_SIZE;
+                            long size = strtol(value, NULL, 0);
+                            if (size < MIN_XVC_BUFFER_SIZE) {
+                                LOG_WARN("xvc_buffer_size %ld too small, using minimum %d",
+                                         size, MIN_XVC_BUFFER_SIZE);
+                                size = MIN_XVC_BUFFER_SIZE;
+                            } else if (size > MAX_XVC_BUFFER_SIZE) {
+                                LOG_WARN("xvc_buffer_size %ld too large, using maximum %d",
+                                         size, MAX_XVC_BUFFER_SIZE);
+                                size = MAX_XVC_BUFFER_SIZE;
                             }
+                            inst->xvc_buffer_size = (int)size;
+                        } else if (strcmp(setting, "usb_chunk_size") == 0) {
+                            inst->usb_chunk_size = atoi(value);
                         }
                     }
                 }
@@ -323,6 +329,9 @@ int config_save(const xvc_global_config_t *config, const char *path)
             }
             if (inst->xvc_buffer_size != DEFAULT_XVC_BUFFER_SIZE) {
                 fprintf(fp, "%d:xvc_buffer_size = %d\n", inst->instance_id, inst->xvc_buffer_size);
+            }
+            if (inst->usb_chunk_size > 0) {
+                fprintf(fp, "%d:usb_chunk_size = %d\n", inst->instance_id, inst->usb_chunk_size);
             }
         }
     }

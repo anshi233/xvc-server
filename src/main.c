@@ -74,20 +74,31 @@ static void setup_signals(void)
 static int on_client_data(void *user_data, tcp_connection_t *conn)
 {
     instance_ctx_t *ctx = (instance_ctx_t*)user_data;
-    
+
     /* Initialize XVC context for this connection if needed */
     if (ctx->xvc.socket_fd != conn->fd) {
-        xvc_init(&ctx->xvc, conn->fd, ctx->ftdi, ctx->config->xvc_buffer_size);
+        /* Clean up previous XVC context if any */
+        xvc_free(&ctx->xvc);
+
+        /* Initialize with configured buffer sizes */
+        int ret = xvc_init(&ctx->xvc, conn->fd, ctx->ftdi,
+                           ctx->config->xvc_buffer_size,
+                           ctx->config->usb_chunk_size);
+        if (ret < 0) {
+            LOG_ERROR("Failed to initialize XVC context");
+            return 1;  /* Close connection */
+        }
     }
-    
+
     /* Handle XVC protocol */
     int ret = xvc_handle(&ctx->xvc, ctx->config->frequency);
-    
+
     if (ret != 0) {
         xvc_close(&ctx->xvc);
+        xvc_free(&ctx->xvc);
         return 1;  /* Close connection */
     }
-    
+
     return 0;  /* Continue */
 }
 
@@ -164,14 +175,6 @@ static int run_instance(xvc_instance_config_t *inst_config)
     }
     if (inst_config->latency_timer > 0) {
         ftdi_adapter_set_latency(ctx.ftdi, inst_config->latency_timer);
-    }
-    
-    /* Set buffer size if configured */
-    if (inst_config->xvc_buffer_size != DEFAULT_XVC_BUFFER_SIZE) {
-        if (ftdi_adapter_set_buffer_size(ctx.ftdi, inst_config->xvc_buffer_size) < 0) {
-            LOG_WARN("Failed to set buffer size to %d, using default",
-                     inst_config->xvc_buffer_size);
-        }
     }
     
     /* Load whitelist */
