@@ -29,7 +29,7 @@ else
     # Use local vendor libraries (static linking)
     VENDOR_LIBUSB = ./vendor/libusb/install
     VENDOR_LIBFTDI = ./vendor/libftdi1/install
-    CFLAGS += -I$(VENDOR_LIBFTDI)/include/libftdi1 -I$(VENDOR_LIBUSB)/include/libusb-1.0
+    CFLAGS += -I$(VENDOR_LIBFTDI)/include/libftdi1 -I$(VENDOR_LIBUSB)/include
     LDFLAGS_SERVER = $(VENDOR_LIBFTDI)/lib/libftdi1.a $(VENDOR_LIBUSB)/lib/libusb-1.0.a -lpthread -lm
     LDFLAGS_DISCOVER = $(VENDOR_LIBUSB)/lib/libusb-1.0.a -lpthread
 endif
@@ -59,6 +59,8 @@ SERVER_SOURCES = $(SRC_DIR)/main.c \
                   $(SRC_DIR)/xvc_protocol.c \
                   $(SRC_DIR)/ftdi_adapter.c \
                   $(SRC_DIR)/mpsse_adapter.c \
+                  $(SRC_DIR)/usb_layer.c \
+                  $(SRC_DIR)/async_usb.c \
                   $(SRC_DIR)/config.c \
                   $(SRC_DIR)/whitelist.c \
                   $(SRC_DIR)/logging.c

@@ -14,6 +14,8 @@
 #include <sys/time.h>
 #include <ftdi.h>
 #include "mpsse_adapter.h"
+#include "async_usb.h"
+#include "usb_layer.h"
 #include "logging.h"
 
 #define OP_SHIFT_WR_FALLING_FLAG  0x01
@@ -80,6 +82,7 @@ struct mpsse_buffer {
 
 struct mpsse_context_s {
     struct ftdi_context ftdi;
+    async_usb_context_t *async;  /* Async USB context for non-blocking transfers */
     struct mpsse_buffer buffer;
     enum jtag_state state;
     bool last_tdi;
@@ -250,6 +253,128 @@ static int mpsse_chip_recovery(mpsse_context_t *ctx)
     ftdi_read_data(&ctx->ftdi, junk, sizeof(junk));
     
     LOG_INFO("Chip recovery completed");
+    return 0;
+}
+
+/*==============================================================================
+ * Async USB Flush Implementation
+ *===========================================================================*/
+
+/* Forward declarations */
+static int mpsse_buffer_flush(mpsse_context_t *ctx);
+
+/* RX completion context for async transfers */
+struct rx_completion_ctx {
+    mpsse_context_t *mpsse_ctx;
+    struct rx_observer_node *observers;
+    int expected_rx_bytes;
+    uint8_t *rx_buffer;
+};
+
+/* RX completion callback */
+static void mpsse_rx_complete(async_transfer_t *xfer, void *user_data)
+{
+    struct rx_completion_ctx *rx_ctx = user_data;
+    
+    if (xfer->status != ASYNC_STATUS_COMPLETED) {
+        LOG_ERROR("RX transfer failed: seq=%u, error=%d", 
+                  xfer->sequence, xfer->error_code);
+        rx_ctx->mpsse_ctx->failed_flushes++;
+        free(rx_ctx);
+        return;
+    }
+    
+    if (xfer->actual_length != rx_ctx->expected_rx_bytes) {
+        LOG_WARN("RX partial: got %zu of %d bytes", 
+                 xfer->actual_length, rx_ctx->expected_rx_bytes);
+    }
+    
+    /* Process received data through observers */
+    for (struct rx_observer_node *o = rx_ctx->observers; o; o = o->next) {
+        o->fn(xfer->buffer + (o->data - rx_ctx->rx_buffer), o->extra);
+    }
+    
+    LOG_TRACE("Async RX complete: seq=%u, len=%zu", 
+              xfer->sequence, xfer->actual_length);
+    
+    /* Clean up */
+    free(rx_ctx);
+}
+
+/* Async buffer flush - submits transfers and returns immediately */
+static int mpsse_buffer_flush_async(mpsse_context_t *ctx)
+{
+    struct mpsse_buffer *b = &ctx->buffer;
+    
+    if (!ctx->async) {
+        /* Fallback to synchronous if async not initialized */
+        return mpsse_buffer_flush(ctx);
+    }
+    
+    if (b->tx_num_bytes == 0 && b->rx_num_bytes == 0) {
+        return 0;  /* Nothing to flush */
+    }
+    
+    struct timeval now;
+    gettimeofday(&now, NULL);
+    long time_since_last = 0;
+    if (ctx->total_flushes > 0) {
+        time_since_last = time_diff_ms(&ctx->last_flush_time, &now);
+    }
+    
+    LOG_TRACE("Async flush: tx=%d, rx=%d bytes (time since last: %ldms)", 
+              b->tx_num_bytes, b->rx_num_bytes, time_since_last);
+    
+    /* Create RX completion context if we expect data */
+    struct rx_completion_ctx *rx_ctx = NULL;
+    if (b->rx_num_bytes > 0) {
+        rx_ctx = malloc(sizeof(struct rx_completion_ctx));
+        if (!rx_ctx) {
+            LOG_ERROR("Failed to allocate RX completion context");
+            return -1;
+        }
+        rx_ctx->mpsse_ctx = ctx;
+        rx_ctx->observers = b->rx_observer_first;
+        rx_ctx->expected_rx_bytes = b->rx_num_bytes;
+        rx_ctx->rx_buffer = b->rx_buffer;
+    }
+    
+    /* Submit RX request first (before TX) to avoid race condition */
+    if (b->rx_num_bytes > 0 && rx_ctx) {
+        int ret = async_usb_submit_rx(ctx->async,
+                                      b->rx_buffer, b->rx_num_bytes,
+                                      mpsse_rx_complete, rx_ctx);
+        if (ret < 0) {
+            LOG_ERROR("Failed to submit async RX");
+            free(rx_ctx);
+            return -1;
+        }
+        LOG_TRACE("Async RX submitted: %d bytes", b->rx_num_bytes);
+    }
+    
+    /* Submit TX data */
+    if (b->tx_num_bytes > 0) {
+        int ret = async_usb_submit_tx(ctx->async,
+                                      b->tx_buffer, b->tx_num_bytes,
+                                      NULL, NULL);
+        if (ret < 0) {
+            LOG_ERROR("Failed to submit async TX");
+            if (rx_ctx) {
+                free(rx_ctx);
+            }
+            async_usb_cancel_all(ctx->async, false);
+            return -1;
+        }
+        LOG_TRACE("Async TX submitted: %d bytes", b->tx_num_bytes);
+    }
+    
+    /* Clear buffer state - data is now owned by async layer */
+    b->tx_num_bytes = 0;
+    b->rx_num_bytes = 0;
+    b->rx_observer_first = b->rx_observer_last = NULL;
+    ctx->total_flushes++;
+    ctx->last_flush_time = now;
+    
     return 0;
 }
 
@@ -718,6 +843,20 @@ int mpsse_adapter_open(mpsse_context_t *ctx, int vendor, int product, const char
 
     LOG_INFO("Detected %s chip, using %d byte buffer", chip_name, chip_buffer_size);
 
+    /* Create async USB context with chip configuration */
+    const ftdi_chip_config_t *chip = usb_get_chip_config(ctx->ftdi.type);
+    ctx->async = async_usb_create(&ctx->ftdi, chip);
+    if (!ctx->async) {
+        LOG_ERROR("Failed to create async USB context");
+        free(ctx->buffer.tx_buffer);
+        free(ctx->buffer.rx_buffer);
+        ctx->buffer.tx_buffer = NULL;
+        ctx->buffer.rx_buffer = NULL;
+        return -1;
+    }
+    LOG_INFO("Async USB context created: %s, tx_fifo=%d, rx_fifo=%d",
+             chip->name, chip->tx_fifo_bytes, chip->rx_fifo_bytes);
+
     ftdi_usb_reset(&ctx->ftdi);
     ftdi_setflowctrl(&ctx->ftdi, SIO_RTS_CTS_HS);
     ftdi_set_baudrate(&ctx->ftdi, 115200);
@@ -744,6 +883,8 @@ int mpsse_adapter_open(mpsse_context_t *ctx, int vendor, int product, const char
     
     if (ftdi_write_data(&ctx->ftdi, setup_cmds, sizeof(setup_cmds)) < 0) {
         LOG_ERROR("Failed to write setup commands: %s", ftdi_get_error_string(&ctx->ftdi));
+        async_usb_destroy(ctx->async);
+        ctx->async = NULL;
         return -1;
     }
     
@@ -763,6 +904,14 @@ void mpsse_adapter_close(mpsse_context_t *ctx)
     if (!ctx || !ctx->is_open) return;
     
     mpsse_buffer_flush(ctx);
+    
+    /* Destroy async USB context */
+    if (ctx->async) {
+        async_usb_destroy(ctx->async);
+        ctx->async = NULL;
+        LOG_INFO("Async USB context destroyed");
+    }
+    
     ftdi_usb_close(&ctx->ftdi);
     ctx->is_open = false;
     
@@ -857,6 +1006,24 @@ int mpsse_adapter_scan(mpsse_context_t *ctx, const uint8_t *tms, const uint8_t *
 int mpsse_adapter_flush(mpsse_context_t *ctx)
 {
     if (!ctx || !ctx->is_open) return -1;
+    
+    /* Use async flush if available */
+    if (ctx->async) {
+        int ret = mpsse_buffer_flush_async(ctx);
+        if (ret < 0) {
+            return -1;
+        }
+        
+        /* Wait for all async transfers to complete */
+        if (async_usb_flush(ctx->async, 5000) < 0) {
+            LOG_ERROR("Async flush timeout");
+            return -1;
+        }
+        
+        return 0;
+    }
+    
+    /* Fallback to synchronous flush */
     return mpsse_buffer_flush(ctx);
 }
 
