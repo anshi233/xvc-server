@@ -11,25 +11,23 @@
 #include "xvc_protocol.h"
 #include "ftdi_adapter.h"
 #include "logging.h"
-#include "config.h"
 
-/* Helper to dump buffer in trace mode - DISABLED for performance */
+/* Helper to dump buffer in trace mode */
 static void log_buffer(const char *prefix, const uint8_t *buf, int len)
 {
-    (void)prefix;
-    (void)buf;
-    (void)len;
-    /* Disabled - too slow for high-speed JTAG */
-    return;
-}
+    if (!log_enabled(XVC_LOG_TRACE)) return;
 
-/* Profiling helper */
-#include <sys/time.h>
-static inline long long time_us(void)
-{
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    return (long long)tv.tv_sec * 1000000LL + tv.tv_usec;
+    char line[256];
+    int pos = 0;
+    for (int i = 0; i < len; i++) {
+        pos += snprintf(line + pos, sizeof(line) - pos, "%02x ", buf[i]);
+        /* Flush line every 32 bytes or at end */
+        if ((i + 1) % 16 == 0 || i == len - 1) {
+            LOG_TRACE("%s: %s", prefix, line);
+            pos = 0;
+            line[0] = '\0';
+        }
+    }
 }
 
 /* JTAG state machine transitions */
@@ -115,68 +113,33 @@ const char* jtag_state_name(jtag_state_t state)
     return "UNKNOWN";
 }
 
-int xvc_init(xvc_context_t *ctx, int socket_fd, struct ftdi_context_s *ftdi,
-             int max_vector_size, int usb_chunk_size)
+int xvc_init(xvc_context_t *ctx, int socket_fd, struct ftdi_context_s *ftdi)
 {
     if (!ctx) return -1;
-
+    
     memset(ctx, 0, sizeof(xvc_context_t));
     ctx->socket_fd = socket_fd;
     ctx->ftdi = ftdi;
     ctx->jtag_state = JTAG_TEST_LOGIC_RESET;
     ctx->seen_tlr = false;
-
-    /* Set vector size with bounds checking */
-    if (max_vector_size <= 0) {
-        ctx->max_vector_size = XVC_DEFAULT_MAX_VECTOR_SIZE;
-    } else {
-        ctx->max_vector_size = max_vector_size;
-    }
-    ctx->usb_chunk_size = usb_chunk_size;
-
-    /* Allocate buffers dynamically */
-    ctx->vector_buf = malloc(ctx->max_vector_size);
-    ctx->result_buf = malloc(ctx->max_vector_size);
-
-    if (!ctx->vector_buf || !ctx->result_buf) {
-        free(ctx->vector_buf);
-        free(ctx->result_buf);
-        ctx->vector_buf = NULL;
-        ctx->result_buf = NULL;
-        LOG_ERROR("Failed to allocate XVC buffers (size=%d)", ctx->max_vector_size);
-        return -1;
-    }
-
-    LOG_DBG("XVC initialized: max_vector_size=%d, usb_chunk_size=%d",
-            ctx->max_vector_size, ctx->usb_chunk_size);
-
+    
     return 0;
-}
-
-void xvc_free(xvc_context_t *ctx)
-{
-    if (!ctx) return;
-
-    free(ctx->vector_buf);
-    free(ctx->result_buf);
-    ctx->vector_buf = NULL;
-    ctx->result_buf = NULL;
 }
 
 void xvc_close(xvc_context_t *ctx)
 {
     if (!ctx) return;
-
+    
     LOG_DBG("XVC session closed: rx=%lu tx=%lu cmds=%lu",
               ctx->bytes_rx, ctx->bytes_tx, ctx->commands);
 }
 
 int xvc_handle(xvc_context_t *ctx, uint32_t frequency)
 {
-    if (!ctx || !ctx->vector_buf || !ctx->result_buf) return -1;
-
+    if (!ctx) return -1;
+    
     char xvc_info[64];
-    snprintf(xvc_info, sizeof(xvc_info), "%s:%d\n", XVC_VERSION, ctx->max_vector_size);
+    snprintf(xvc_info, sizeof(xvc_info), "%s:%d\n", XVC_VERSION, XVC_MAX_VECTOR_SIZE);
     
     do {
         /* Read command (first 2 bytes) */
@@ -236,85 +199,72 @@ int xvc_handle(xvc_context_t *ctx, uint32_t frequency)
         
         /* Handle shift */
         if (memcmp(ctx->cmd_buf, "sh", 2) == 0) {
-            long long t_start = time_us();
-            long long t_read = 0, t_scan = 0, t_write = 0;
-
             if (xvc_read_exact(ctx->socket_fd, ctx->cmd_buf + 2, 4) != 1) {
                 return 1;
             }
             ctx->bytes_rx += 4;
-
+            
             /* Read length */
             if (xvc_read_exact(ctx->socket_fd, ctx->cmd_buf + 6, 4) != 1) {
                 LOG_ERROR("Reading shift length failed");
                 return 1;
             }
             ctx->bytes_rx += 4;
-
+            
             int32_t len = xvc_get_int32(ctx->cmd_buf + 6);
             int nr_bytes = (len + 7) / 8;
-
-            if (nr_bytes > ctx->max_vector_size) {
-                LOG_ERROR("Vector size exceeded: %d > %d", nr_bytes, ctx->max_vector_size);
+            
+            if (nr_bytes > XVC_MAX_VECTOR_SIZE) {
+                LOG_ERROR("Vector size exceeded: %d", nr_bytes);
                 return -1;
             }
-
+            
             /* Read TMS and TDI data */
             if (xvc_read_exact(ctx->socket_fd, ctx->vector_buf, nr_bytes * 2) != 1) {
                 LOG_ERROR("Reading shift data failed");
                 return 1;
             }
             ctx->bytes_rx += nr_bytes * 2;
-            t_read = time_us();
-
+            
             memset(ctx->result_buf, 0, nr_bytes);
-
+            
             /* Track TLR state for safe client switching */
             ctx->seen_tlr = (ctx->seen_tlr || ctx->jtag_state == JTAG_TEST_LOGIC_RESET) &&
                             (ctx->jtag_state != JTAG_CAPTURE_DR) &&
                             (ctx->jtag_state != JTAG_CAPTURE_IR);
-
+            
             /* Skip bogus state movements (Xilinx impact workaround) */
             bool skip = false;
             if ((ctx->jtag_state == JTAG_EXIT1_IR && len == 5 && ctx->vector_buf[0] == 0x17) ||
                 (ctx->jtag_state == JTAG_EXIT1_DR && len == 4 && ctx->vector_buf[0] == 0x0b)) {
-                LOG_DBG("Ignoring bogus jtag state movement in state %s",
+                LOG_DBG("Ignoring bogus jtag state movement in state %s", 
                           jtag_state_name(ctx->jtag_state));
                 skip = true;
             }
-
+            
             if (!skip) {
                 /* Update JTAG state machine */
                 for (int i = 0; i < len; i++) {
                     int tms = !!(ctx->vector_buf[i / 8] & (1 << (i & 7)));
                     ctx->jtag_state = jtag_step(ctx->jtag_state, tms);
                 }
-
+                
                 /* Perform scan operation */
-                /* Use chunked scan if usb_chunk_size is configured */
-                int scan_result;
-                if (ctx->usb_chunk_size > 0) {
-                    scan_result = ftdi_adapter_scan_chunked(ctx->ftdi,
-                                                            ctx->vector_buf,
-                                                            ctx->vector_buf + nr_bytes,
-                                                            ctx->result_buf,
-                                                            len,
-                                                            ctx->usb_chunk_size);
-                } else {
-                    scan_result = ftdi_adapter_scan(ctx->ftdi,
-                                                    ctx->vector_buf,
-                                                    ctx->vector_buf + nr_bytes,
-                                                    ctx->result_buf,
-                                                    len);
-                }
-                t_scan = time_us();
+                log_buffer("TMS", ctx->vector_buf, nr_bytes);
+                log_buffer("TDI", ctx->vector_buf + nr_bytes, nr_bytes);
 
-                if (scan_result < 0) {
+                if (ftdi_adapter_scan(ctx->ftdi, 
+                                      ctx->vector_buf, 
+                                      ctx->vector_buf + nr_bytes,
+                                      ctx->result_buf, 
+                                      len) < 0) {
                     LOG_ERROR("FTDI scan failed");
                     return -1;
                 }
+                
+                log_buffer("TDO", ctx->result_buf, nr_bytes);
             }
-
+            
             /* Send TDO result */
             if (xvc_write_exact(ctx->socket_fd, ctx->result_buf, nr_bytes) < 0) {
                 LOG_ERROR("Write failed for shift result");
@@ -322,15 +272,6 @@ int xvc_handle(xvc_context_t *ctx, uint32_t frequency)
             }
             ctx->bytes_tx += nr_bytes;
             ctx->commands++;
-            t_write = time_us();
-
-            /* Profiling output */
-            long long total = t_write - t_start;
-            long long read_time = t_read - t_start;
-            long long scan_time = t_scan - t_read;
-            long long write_time = t_write - t_scan;
-            LOG_DBG("PROF: len=%d total=%lldus read=%lldus scan=%lldus write=%lldus",
-                    len, total, read_time, scan_time, write_time);
             
         } else {
             LOG_ERROR("Invalid command: '%c%c' (0x%02x 0x%02x)", 

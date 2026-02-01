@@ -11,7 +11,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <alloca.h>
 #include <ftdi.h>
 #include "ftdi_adapter.h"
 #include "mpsse_adapter.h"
@@ -403,79 +402,14 @@ int ftdi_adapter_scan(ftdi_context_t *ctx,
     }
     
     /* Extract TDO bits from returned data */
-    int tdo_bytes = (bits + 7) / 8;
-    if (tdo_bytes > 0) {
-        memset(tdo, 0, tdo_bytes);
-        for (int i = 0; i < bits; i++) {
-            if (buffer[i * 2 + 1] & FTDI_PORT_TDO) {
-                tdo[i / 8] |= 1 << (i & 7);
-            }
+    memset(tdo, 0, (bits + 7) / 8);
+    for (int i = 0; i < bits; i++) {
+        if (buffer[i * 2 + 1] & FTDI_PORT_TDO) {
+            tdo[i / 8] |= 1 << (i & 7);
         }
     }
-
+    
     free(buffer);
-    return 0;
-}
-
-int ftdi_adapter_scan_chunked(ftdi_context_t *ctx,
-                               const uint8_t *tms,
-                               const uint8_t *tdi,
-                               uint8_t *tdo,
-                               int bits,
-                               int chunk_bytes)
-{
-    if (!ctx || !ctx->is_open || !tms || !tdi || !tdo || bits <= 0) return -1;
-
-    /* Use default chunk size if not specified */
-    if (chunk_bytes <= 0) {
-        chunk_bytes = FTDI_MAX_WRITESIZE;
-    }
-
-    /* Calculate total bytes needed */
-    int total_bytes = (bits + 7) / 8;
-
-    /* If the transfer fits in one chunk, use regular scan */
-    if (total_bytes <= chunk_bytes) {
-        return ftdi_adapter_scan(ctx, tms, tdi, tdo, bits);
-    }
-
-    /* For large transfers, split into chunks */
-    LOG_DBG("Chunked scan: %d bits (%d bytes) in chunks of %d bytes",
-            bits, total_bytes, chunk_bytes);
-
-    /* Clear output buffer */
-    memset(tdo, 0, total_bytes);
-
-    /* Process in chunks of bits (each chunk must be byte-aligned for simplicity) */
-    int bits_processed = 0;
-    int chunk_bits = chunk_bytes * 8;
-
-    while (bits_processed < bits) {
-        int current_chunk_bits = chunk_bits;
-        if (bits_processed + current_chunk_bits > bits) {
-            current_chunk_bits = bits - bits_processed;
-        }
-
-        /* Calculate byte offsets */
-        int byte_offset = bits_processed / 8;
-        int current_chunk_bytes = (current_chunk_bits + 7) / 8;
-
-        /* Perform scan for this chunk */
-        uint8_t *chunk_tdo = alloca(current_chunk_bytes);
-        memset(chunk_tdo, 0, current_chunk_bytes);
-
-        int ret = ftdi_adapter_scan(ctx, tms + byte_offset, tdi + byte_offset, chunk_tdo, current_chunk_bits);
-        if (ret < 0) {
-            LOG_ERROR("Chunked scan failed at bit %d", bits_processed);
-            return -1;
-        }
-
-        /* Copy result to output buffer */
-        memcpy(tdo + byte_offset, chunk_tdo, current_chunk_bytes);
-
-        bits_processed += current_chunk_bits;
-    }
-
     return 0;
 }
 
